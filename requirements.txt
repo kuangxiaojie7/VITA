@@ -1,0 +1,10 @@
+# Core deep learning stack
+torch>=2.0.0
+numpy>=1.23
+pyyaml>=6.0
+
+# SMAC environment wrapper (StarCraft II)
+smacv2==2.0.1
+
+# Visualization of training logs
+matplotlib>=3.8

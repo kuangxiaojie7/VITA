@@ -1,0 +1,126 @@
+# VITA：变分信息论可信多智能体框架
+
+本仓库实现了 VITA（Variational Information-Theoretic Trustworthy Agents）以及 MAPPO 基线，可在 SMAC（StarCraft Multi-Agent Challenge）中检验多智能体鲁棒性。核心特性：
+
+- 统一训练入口 `src/main.py`，通过 YAML 配置切换 MAPPO / VITA。
+- `src/vita/` 下的模块化实现严格对应 Plan.md：`components/feature_encoder.py`（局部编码）、`trust_predictor.py`（自监督信任）、`vib_gat.py`（信息瓶颈 + 注意力）和 `residual_policy.py`（门控残差），最终由 `agent.py` 组装。
+- KL/信任正则化的 PPO 训练器（VITA）与标准 MAPPO 训练器共享同一个 rollout buffer。
+- SMAC 封装支持高斯噪声、丢包和恶意队友，方便构造压力测试。
+- 自带日志、配置加载器与 `tools/plot_training.py` 可视化脚本。
+
+## 环境准备
+
+1. 安装依赖（示例使用 Conda）：
+   ```bash
+   conda create -n vita python=3.10 -y
+   conda activate vita
+   pip install -r requirements.txt
+   ```
+2. 按 SMAC 官方说明安装 StarCraft II 客户端与地图资源（默认路径 `~/.sc2`，或设置 `SC2PATH` 指向解压目录）。
+3. 确认服务器上的两张 4090D GPU 可用：
+   ```bash
+   nvidia-smi
+   ```
+
+## 在同一服务器使用两张 4090D
+
+默认单进程单卡。通过设置 `CUDA_VISIBLE_DEVICES` 可以在两个终端分别启动 MAPPO 与 VITA；如需单命令驱动两卡，可使用 `torchrun --nproc_per_node=2`。
+
+### Windows PowerShell（单进程单卡）
+```powershell
+# GPU0：MAPPO 基线
+$env:CUDA_VISIBLE_DEVICES="0"
+python -m src.main --config configs/smac/mappo_3s5z.yaml --log-dir runs/gpu0
+
+# GPU1：VITA 噪声实验
+$env:CUDA_VISIBLE_DEVICES="1"
+python -m src.main --config configs/smac/vita_3s5z_noise.yaml --log-dir runs/gpu1
+```
+
+### Linux / WSL（单进程单卡）
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.main --config configs/smac/mappo_3s5z.yaml --log-dir runs/gpu0
+CUDA_VISIBLE_DEVICES=1 python -m src.main --config configs/smac/vita_3s5z_noise.yaml --log-dir runs/gpu1
+```
+
+### torchrun 并行示例
+```bash
+torchrun --nproc_per_node=2 --master_port=29501 \
+    src/main.py --config configs/smac/mappo_3s5z.yaml --log-dir runs/mappo_dist
+
+torchrun --nproc_per_node=2 --master_port=29502 \
+    src/main.py --config configs/smac/vita_3s5z_noise.yaml --log-dir runs/vita_dist
+```
+> 每个进程都会自行加载配置，建议在不同终端中指定 `--config` 与 `--log-dir`，即可在同一服务器上并行训练 MAPPO 与 VITA。
+
+## 运行示例
+
+1. MAPPO 基线（无噪声）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -m src.main --config configs/smac/mappo_3s5z.yaml --log-dir runs/mappo_clean
+   ```
+2. VITA 噪声/恶意场景：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1 python -m src.main --config configs/smac/vita_3s5z_noise.yaml --log-dir runs/vita_noise
+   ```
+
+## 结果可视化
+
+训练日志为 JSON 行格式，位于 `runs/<algo>/train.log`。可用以下命令绘制曲线：
+```bash
+python tools/plot_training.py \
+    --log-file runs/vita_noise/train.log \
+    --metrics episode_reward,policy_loss,value_loss,kl,trust_loss \
+    --smooth 20 \
+    --output figures/vita_noise.png
+```
+
+## 配置说明
+
+- `configs/smac/mappo_3s5z.yaml`：SMAC 3s5z 标准场景，`history_length=1`，128 维循环策略。
+- `configs/smac/vita_3s5z_noise.yaml`：同一地图但附加高斯噪声（0.1）、丢包率（0.1）和恶意队友（5%）。`history_length=4` 用于构造观测序列，`trust_gamma=2.0` 控制信任衰减，`trust_lambda=0.5` 权衡监督强度。
+
+可直接修改 YAML 中的噪声、`max_neighbors`、`history_length` 等字段，快速生成新的干扰组合。
+
+## MAPPO vs. VITA
+
+- **架构**：VITA 在局部编码后串联自监督信任预测、变分信息瓶颈 GAT 与门控残差，确保与独立学习相同的性能下界；MAPPO 仅使用常规集中式 actor-critic。
+- **损失**：VITA 的 PPO 目标额外包含 KL 正则与 `exp(-γ·MSE)` 信任监督，对噪声/恶意代理更鲁棒。
+- **数据处理**：VITA 的 rollout buffer 记录邻居观测序列、邻居动作序列以及 Top-K 邻居索引，供信任模块学习；MAPPO 只消费单步观测。
+
+## 目录结构
+
+```
+configs/
+  smac/
+    mappo_3s5z.yaml
+    vita_3s5z_noise.yaml
+src/
+  algorithms/
+    mappo.py
+    vita.py
+  envs/
+    smac_wrapper.py
+  models/
+    __init__.py
+    recurrent_policy.py
+  utils/
+    rollout.py
+    logger.py
+    config_loader.py
+    seeding.py
+  vita/
+    components/
+      feature_encoder.py
+      trust_predictor.py
+      vib_gat.py
+      residual_policy.py
+    agent.py
+  main.py
+tools/
+  plot_training.py
+Plan.md
+requirements.txt
+```
+
+该结构便于扩展到 SMAC v2 或新的噪声类型，只需增加 YAML、组件或训练脚本即可。
