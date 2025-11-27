@@ -46,6 +46,15 @@ class VITAAgent(torch.nn.Module):
         feat, _ = self.actor_encoder(flat, None, None)
         return feat.view(B, K, -1)
 
+    def _mask_logits(self, logits: torch.Tensor, avail_actions: torch.Tensor | None) -> torch.Tensor:
+        if avail_actions is None:
+            return logits
+        mask = (avail_actions < 0.5)
+        all_masked = mask.all(dim=-1, keepdim=True)
+        if all_masked.any():
+            mask = mask & (~all_masked)
+        return logits.masked_fill(mask, -1e9)
+
     def act(
         self,
         obs_seq: torch.Tensor,
@@ -55,6 +64,7 @@ class VITAAgent(torch.nn.Module):
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
         masks: torch.Tensor,
+        avail_actions: torch.Tensor,
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
         self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
@@ -63,6 +73,7 @@ class VITAAgent(torch.nn.Module):
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
+        logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
         if deterministic:
             actions = torch.argmax(logits, dim=-1, keepdim=True)
@@ -94,6 +105,7 @@ class VITAAgent(torch.nn.Module):
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
         masks: torch.Tensor,
+        avail_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         self_feat, _ = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
         neighbor_feat = self._encode_neighbors(neighbor_seq)
@@ -101,6 +113,7 @@ class VITAAgent(torch.nn.Module):
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
         fused = self.residual(self_feat, comm_feat)
         logits = self.policy_head(fused)
+        logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions.squeeze(-1)).unsqueeze(-1)
         entropy = dist.entropy().unsqueeze(-1)

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any
 
+import torch.distributed as dist
 
 class Logger:
     """Minimal logger that prints to stdout and appends JSON lines to disk."""
@@ -19,10 +20,30 @@ class Logger:
         payload = {"time": time.time(), **metrics}
         if step is not None:
             payload["step"] = step
+        if not self._should_log():
+            return
         line = json.dumps(payload, ensure_ascii=False)
         print(line)
         self.file.write(line + "\n")
         self.file.flush()
+
+    @staticmethod
+    def _should_log() -> bool:
+        rank_env = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
+        if rank_env is not None:
+            try:
+                if int(rank_env) != 0:
+                    return False
+            except ValueError:
+                pass
+        if not dist.is_available():
+            return True
+        if not dist.is_initialized():
+            return True
+        try:
+            return dist.get_rank() == 0
+        except RuntimeError:
+            return True
 
     def close(self) -> None:
         try:

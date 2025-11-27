@@ -18,12 +18,12 @@ else:
 @dataclass
 class SMACConfig:
     map_name: str
+    name: str | None = None
     difficulty: str = "7"
     reward_only_positive: bool = True
     reward_scale: float = 1.0
     obs_last_action: bool = True
     state_last_action: bool = False
-    state_last_enemy_action: bool = False
     num_envs: int = 1
     obs_noise_std: float = 0.0
     packet_drop_prob: float = 0.0
@@ -47,7 +47,6 @@ class SMACWrapper:
                 reward_only_positive=cfg.reward_only_positive,
                 obs_last_action=cfg.obs_last_action,
                 state_last_action=cfg.state_last_action,
-                state_last_enemy_action=cfg.state_last_enemy_action,
             )
             for _ in range(cfg.num_envs)
         ]
@@ -56,38 +55,57 @@ class SMACWrapper:
         self.state_dim = self.envs[0].get_state_size()
         self.action_dim = self.envs[0].n_actions
 
-    def reset(self) -> tuple[np.ndarray, np.ndarray]:
-        obs, states = [], []
+    def reset(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        obs, states, avails = [], [], []
         for env in self.envs:
             env.reset()
             obs.append(np.stack(env.get_obs()))  # [n_agents, obs_dim]
             states.append(env.get_state())
+            avails.append(np.stack(env.get_avail_actions()))
         obs = np.stack(obs)
         states = np.stack(states)
+        avail = np.stack(avails)
         obs = self._process_obs(obs)
-        return obs, states
+        return obs, states, avail
 
     def step(
         self, actions: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """Actions shape: [num_envs, n_agents]."""
-        next_obs_list, state_list, reward_list, done_list, info_list = [], [], [], [], []
+        next_obs_list, state_list, reward_list, done_list, avail_list, info_list = [], [], [], [], [], []
         for idx, env in enumerate(self.envs):
             env_actions = actions[idx]
+            avail = np.stack(env.get_avail_actions())
+            for agent_id in range(self.n_agents):
+                act = env_actions[agent_id]
+                if avail[agent_id, act] < 0.5:
+                    valid = np.nonzero(avail[agent_id] > 0.5)[0]
+                    env_actions[agent_id] = valid[0] if valid.size > 0 else 0
             if self.cfg.malicious_agent_prob > 0:
                 mask = np.random.rand(self.n_agents) < self.cfg.malicious_agent_prob
-                random_actions = np.random.randint(0, self.action_dim, size=mask.sum())
                 env_actions = env_actions.copy()
-                env_actions[mask] = random_actions
+                for agent_id in range(self.n_agents):
+                    if not mask[agent_id]:
+                        continue
+                    valid = np.nonzero(avail[agent_id] > 0.5)[0]
+                    if valid.size > 0:
+                        env_actions[agent_id] = np.random.choice(valid)
+                    else:
+                        env_actions[agent_id] = 0
             reward, terminated, _ = env.step(env_actions.tolist())
             reward *= self.cfg.reward_scale
-            info = env.get_stats()
+            try:
+                info = env.get_stats()
+            except ZeroDivisionError:
+                info = {}
             next_obs = np.stack(env.get_obs())
             state = env.get_state()
+            avail = np.stack(env.get_avail_actions())
             next_obs_list.append(next_obs)
             state_list.append(state)
             reward_list.append(np.full((self.n_agents,), reward, dtype=np.float32))
             done_list.append(np.array([terminated] * self.n_agents))
+            avail_list.append(avail)
             info_list.append(info)
             if terminated:
                 env.reset()
@@ -98,6 +116,7 @@ class SMACWrapper:
             np.stack(state_list),
             np.stack(reward_list),
             np.stack(done_list),
+            np.stack(avail_list),
             info_list,
         )
 

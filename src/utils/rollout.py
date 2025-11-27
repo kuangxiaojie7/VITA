@@ -21,6 +21,7 @@ class EpisodeBatch:
     neighbor_obs: torch.Tensor
     neighbor_actions: torch.Tensor
     neighbor_obs_seq: torch.Tensor
+    avail_actions: torch.Tensor
 
 
 class MAPPOBuffer:
@@ -69,6 +70,9 @@ class MAPPOBuffer:
         self.neighbor_actions = torch.zeros(
             episode_length, num_envs, num_agents, max_neighbors, action_dim, device=device
         )
+        self.avail_actions = torch.zeros(
+            episode_length, num_envs, num_agents, action_dim, device=device
+        )
         self.obs_sequences = torch.zeros(
             episode_length,
             num_envs,
@@ -116,6 +120,7 @@ class MAPPOBuffer:
         neighbor_actions: torch.Tensor,
         obs_seq: torch.Tensor,
         neighbor_obs_seq: torch.Tensor,
+        avail_actions: torch.Tensor,
     ) -> None:
         self.obs[self.step + 1].copy_(next_obs)
         self.states[self.step + 1].copy_(next_state)
@@ -130,6 +135,7 @@ class MAPPOBuffer:
         self.neighbor_actions[self.step].copy_(neighbor_actions)
         self.obs_sequences[self.step].copy_(obs_seq)
         self.neighbor_obs_sequences[self.step].copy_(neighbor_obs_seq)
+        self.avail_actions[self.step].copy_(avail_actions)
         self.step = (self.step + 1) % self.episode_length
 
     def compute_returns(self, last_values: torch.Tensor, gamma: float, gae_lambda: float) -> None:
@@ -143,7 +149,9 @@ class MAPPOBuffer:
             )
             gae = delta + gamma * gae_lambda * self.masks[step + 1] * gae
             self.advantages[step] = gae
-        self.returns = self.advantages + self.values[:-1]
+        self.advantages[-1].zero_()
+        self.returns[:-1] = self.advantages[:-1] + self.values[:-1]
+        self.returns[-1].copy_(self.values[-1])
 
     def after_update(self) -> None:
         self.obs[0].copy_(self.obs[-1])
@@ -167,6 +175,7 @@ class MAPPOBuffer:
             neighbor_obs=self.neighbor_obs.clone(),
             neighbor_actions=self.neighbor_actions.clone(),
             neighbor_obs_seq=self.neighbor_obs_sequences.clone(),
+            avail_actions=self.avail_actions.clone(),
         )
 
     def mini_batch_generator(
@@ -189,6 +198,9 @@ class MAPPOBuffer:
         )
         neighbor_actions = self.neighbor_actions.reshape(
             episode_length * num_envs * num_agents, self.max_neighbors, self.action_dim
+        )
+        avail_actions = self.avail_actions.reshape(
+            episode_length * num_envs * num_agents, self.action_dim
         )
         obs_seq = self.obs_sequences.reshape(
             episode_length * num_envs * num_agents, self.history_length, self.obs_dim
@@ -220,4 +232,5 @@ class MAPPOBuffer:
                 "neighbor_obs": neighbor_obs[mb_idx],
                 "neighbor_actions": neighbor_actions[mb_idx],
                 "neighbor_obs_seq": neighbor_obs_seq[mb_idx],
+                "avail_actions": avail_actions[mb_idx],
             }

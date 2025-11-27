@@ -24,6 +24,8 @@ class VITATrainParams:
     entropy_coef: float = 0.01
     value_loss_coef: float = 0.5
     max_grad_norm: float = 10.0
+    trust_warmup_updates: int = 0
+    kl_warmup_updates: int = 0
 
 
 class VITATrainer:
@@ -74,35 +76,43 @@ class VITATrainer:
             history_length=self.history_length,
         )
         self.obs_history: Deque[torch.Tensor] | None = None
+        self._current_update: int = 0
 
     def train(self) -> None:
-        obs_np, state_np = self.env.reset()
-        obs = torch.from_numpy(obs_np).float().to(self.device)
-        state = torch.from_numpy(state_np).float().to(self.device)
+        obs_np, state_np, avail_np = self.env.reset()
+        obs = torch.from_numpy(obs_np).to(self.device).float()
+        state = torch.from_numpy(state_np).to(self.device).float()
+        avail_actions = torch.from_numpy(avail_np).to(self.device).float()
         actor_states = torch.zeros(self.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
         critic_states = torch.zeros_like(actor_states)
         masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
         self._initialize_history(obs)
 
         for update in range(1, self.train_cfg.updates + 1):
+            self._current_update = update
             self.buffer.reset(obs, state, actor_states, critic_states)
             reward_sum = 0.0
             for step in range(self.train_cfg.episode_length):
-                obs_seq = self._stack_history().contiguous()
+                obs_seq = self._stack_history().contiguous().float()
+                obs = obs.float()
+                state = state.float()
+                avail_actions = avail_actions.float()
                 neighbor_indices = self._select_topk_neighbors(obs_seq)
                 neighbor_seq = self._gather_neighbor_sequences(obs_seq, neighbor_indices).contiguous()
-                flat_obs_seq = obs_seq.view(self.num_envs * self.num_agents, self.history_length, self.obs_dim)
+                flat_obs_seq = obs_seq.view(self.num_envs * self.num_agents, self.history_length, self.obs_dim).float()
                 flat_state = (
                     state.unsqueeze(1)
                     .repeat(1, self.num_agents, 1)
                     .view(self.num_envs * self.num_agents, self.state_dim)
                 )
+                flat_state = flat_state.float()
                 flat_neighbor_seq = neighbor_seq.view(
                     self.num_envs * self.num_agents, self.max_neighbors, self.history_length, self.obs_dim
-                )
-                flat_actor = actor_states.view(self.num_envs * self.num_agents, -1)
-                flat_critic = critic_states.view(self.num_envs * self.num_agents, -1)
-                flat_masks = masks.view(self.num_envs * self.num_agents, 1)
+                ).float()
+                flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
+                flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
+                flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
+                flat_avail = avail_actions.view(self.num_envs * self.num_agents, self.action_dim).float()
 
                 outputs = self.agent.act(
                     flat_obs_seq,
@@ -112,28 +122,30 @@ class VITATrainer:
                     flat_actor,
                     flat_critic,
                     flat_masks,
+                    flat_avail,
                 )
-                actions = outputs["actions"]
+                actions = self._ensure_valid_actions(outputs["actions"], avail_actions)
                 log_probs = outputs["log_probs"]
                 values = outputs["values"]
                 next_actor = outputs["next_actor_state"]
                 next_critic = outputs["next_critic_state"]
 
                 env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
-                next_obs_np, next_state_np, reward_np, done_np, _ = self.env.step(env_actions)
+                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, _ = self.env.step(env_actions)
                 next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
                 next_state = torch.from_numpy(next_state_np).float().to(self.device)
+                next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
                 rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
                 dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                 reward_sum += rewards.mean().item()
 
-                next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1)
-                next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1)
-                reshaped_actions = actions.view(self.num_envs, self.num_agents, 1)
-                reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1)
-                reshaped_values = values.view(self.num_envs, self.num_agents, 1)
+                next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
+                next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
+                reshaped_actions = actions.view(self.num_envs, self.num_agents, 1).detach()
+                reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1).detach()
+                reshaped_values = values.view(self.num_envs, self.num_agents, 1).detach()
                 action_one_hot = torch.zeros(
-                    self.num_envs, self.num_agents, self.action_dim, device=self.device
+                    self.num_envs, self.num_agents, self.action_dim, device=self.device, dtype=torch.float32
                 )
                 action_one_hot.scatter_(2, reshaped_actions, 1.0)
                 neighbor_action_tensor = self._gather_neighbor_actions(action_one_hot, neighbor_indices)
@@ -154,6 +166,7 @@ class VITATrainer:
                     neighbor_action_tensor,
                     obs_seq,
                     neighbor_seq,
+                    avail_actions,
                 )
 
                 obs = next_obs
@@ -162,14 +175,16 @@ class VITATrainer:
                 critic_states = next_critic_states
                 masks = 1.0 - dones
                 self._update_history(next_obs)
+                avail_actions = next_avail
 
             flat_state = (
                 state.unsqueeze(1)
                 .repeat(1, self.num_agents, 1)
                 .view(self.num_envs * self.num_agents, self.state_dim)
             )
-            flat_critic = critic_states.view(self.num_envs * self.num_agents, -1)
-            flat_masks = masks.view(self.num_envs * self.num_agents, 1)
+            flat_state = flat_state.float()
+            flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
+            flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
             with torch.no_grad():
                 next_values, _ = self.agent.get_values(flat_state, flat_critic, flat_masks)
             next_values = next_values.view(self.num_envs, self.num_agents, 1)
@@ -182,6 +197,7 @@ class VITATrainer:
                 **loss_dict,
             }
             self.logger.log(log_payload, step=update)
+            print(f"[VITA] update {update} completed")
 
     def update_policy(self) -> Dict[str, float]:
         advantages = self.buffer.advantages[:-1]
@@ -195,6 +211,10 @@ class VITATrainer:
         kl_epoch = 0.0
         trust_epoch = 0.0
         updates = 0
+        trust_coeff = self.agent.cfg.trust_lambda * self._schedule_coeff(
+            self._current_update, self.train_cfg.trust_warmup_updates
+        )
+        kl_coeff = self._schedule_coeff(self._current_update, self.train_cfg.kl_warmup_updates)
         for _ in range(self.train_cfg.ppo_epochs):
             for batch in self.buffer.mini_batch_generator(norm_adv, self.train_cfg.num_mini_batch):
                 obs_seq_batch = batch["obs_seq"]
@@ -208,15 +228,17 @@ class VITATrainer:
                 rnn_critic_batch = batch["rnn_states_critic"]
                 neighbor_obs_seq_batch = batch["neighbor_obs_seq"]
                 neighbor_actions_batch = batch["neighbor_actions"]
+                avail_batch = batch["avail_actions"]
                 eval_out = self.agent.evaluate_actions(
-                    obs_seq_batch,
-                    state_batch,
-                    neighbor_obs_seq_batch,
-                    neighbor_actions_batch,
+                    obs_seq_batch.float(),
+                    state_batch.float(),
+                    neighbor_obs_seq_batch.float(),
+                    neighbor_actions_batch.float(),
                     actions_batch,
-                    rnn_actor_batch,
-                    rnn_critic_batch,
-                    masks_batch,
+                    rnn_actor_batch.float(),
+                    rnn_critic_batch.float(),
+                    masks_batch.float(),
+                    avail_batch.float(),
                 )
 
                 log_probs = eval_out["log_probs"]
@@ -238,8 +260,8 @@ class VITATrainer:
                     policy_loss
                     + self.train_cfg.value_loss_coef * value_loss
                     - self.train_cfg.entropy_coef * entropy_loss
-                    + kl_loss
-                    + self.agent.cfg.trust_lambda * trust_loss
+                    + kl_coeff * kl_loss
+                    + trust_coeff * trust_loss
                 )
 
                 self.optimizer.zero_grad()
@@ -263,6 +285,12 @@ class VITATrainer:
             "kl": kl_epoch / denom,
             "trust_loss": trust_epoch / denom,
         }
+
+    @staticmethod
+    def _schedule_coeff(update: int, warmup: int) -> float:
+        if warmup <= 0:
+            return 1.0
+        return min(1.0, max(0.0, update / float(warmup)))
 
     def _initialize_history(self, obs: torch.Tensor) -> None:
         self.obs_history = deque(
@@ -312,3 +340,18 @@ class VITATrainer:
         idx = neighbor_idx.unsqueeze(-1).expand(envs, agents, self.max_neighbors, action_dim)
         gathered = torch.gather(expanded, 2, idx)
         return gathered.contiguous()
+
+    def _ensure_valid_actions(self, actions: torch.Tensor, avail_actions: torch.Tensor) -> torch.Tensor:
+        reshaped = actions.view(self.num_envs, self.num_agents, -1).clone()
+        avail = avail_actions.view(self.num_envs, self.num_agents, self.action_dim)
+        for env_idx in range(self.num_envs):
+            for agent_idx in range(self.num_agents):
+                act = reshaped[env_idx, agent_idx, 0].long()
+                if avail[env_idx, agent_idx, act] < 0.5:
+                    valid = torch.nonzero(avail[env_idx, agent_idx] > 0.5, as_tuple=False)
+                    if valid.numel() == 0:
+                        act = torch.tensor(0, device=actions.device)
+                    else:
+                        act = valid[0, 0]
+                    reshaped[env_idx, agent_idx, 0] = act
+        return reshaped.view(-1, 1)

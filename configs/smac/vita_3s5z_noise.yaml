@@ -13,9 +13,9 @@ model:
   hidden_dim: 192
   latent_dim: 96
   max_neighbors: 5
-  trust_gamma: 2.0
-  kl_beta: 0.001
-  trust_lambda: 0.5
+  trust_gamma: 1.5
+  kl_beta: 0.0005
+  trust_lambda: 0.15
   history_length: 4
 train:
   episode_length: 120
@@ -29,3 +29,5 @@ train:
   entropy_coef: 0.01
   value_loss_coef: 0.5
   max_grad_norm: 10.0
+  trust_warmup_updates: 300
+  kl_warmup_updates: 200

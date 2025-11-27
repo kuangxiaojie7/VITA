@@ -65,6 +65,15 @@ class RecurrentMAPPOPolicy(nn.Module):
     def get_initial_states(self, batch_size: int) -> torch.Tensor:
         return torch.zeros(batch_size, self.cfg.hidden_dim)
 
+    def _mask_logits(self, logits: torch.Tensor, avail_actions: torch.Tensor) -> torch.Tensor:
+        if avail_actions is None:
+            return logits
+        mask = (avail_actions < 0.5)
+        all_masked = mask.all(dim=-1, keepdim=True)
+        if all_masked.any():
+            mask = mask & (~all_masked)
+        return logits.masked_fill(mask, -1e9)
+
     def act(
         self,
         obs: torch.Tensor,
@@ -72,9 +81,11 @@ class RecurrentMAPPOPolicy(nn.Module):
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
         masks: torch.Tensor,
+        avail_actions: torch.Tensor,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, next_actor = self._actor_forward(obs, rnn_states_actor, masks)
+        logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
         if deterministic:
             actions = torch.argmax(logits, dim=-1, keepdim=True)
@@ -93,8 +104,10 @@ class RecurrentMAPPOPolicy(nn.Module):
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
         masks: torch.Tensor,
+        avail_actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, _ = self._actor_forward(obs, rnn_states_actor, masks)
+        logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
         action_log_probs = dist.log_prob(actions.squeeze(-1)).unsqueeze(-1)
         dist_entropy = dist.entropy().unsqueeze(-1)

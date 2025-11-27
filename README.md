@@ -69,7 +69,7 @@ torchrun --nproc_per_node=2 --master_port=29502 \
 训练日志为 JSON 行格式，位于 `runs/<algo>/train.log`。新版脚本支持在同一图中对比多个算法的同一指标，例如：
 ```bash
 python tools/plot_training.py \
-    --log-files runs/mappo_clean/train.log runs/vita_noise/train.log \
+    --log-files runs/mappo_dist/mappo/train.log runs/vita_dist/vita/train.log \
     --labels MAPPO VITA \
     --metrics episode_reward,policy_loss,value_loss,kl,trust_loss \
     --smooth 20 \
