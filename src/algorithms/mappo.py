@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -68,6 +69,8 @@ class MAPPOTrainer:
             device,
             history_length=self.history_length,
         )
+        self._completed_episodes = 0
+        self._won_episodes = 0
 
     def train(self) -> None:
         obs_np, state_np, avail_np = self.env.reset()
@@ -104,12 +107,13 @@ class MAPPOTrainer:
                 actions = self._ensure_valid_actions(raw_actions, avail_actions)
 
                 env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
-                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, _ = self.env.step(env_actions)
+                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
                 next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
                 next_state = torch.from_numpy(next_state_np).float().to(self.device)
                 rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
                 dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                 next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
+                self._update_win_rate(done_np, info_list)
 
                 episode_rewards += rewards.mean().item()
 
@@ -165,6 +169,7 @@ class MAPPOTrainer:
             log_data = {
                 "update": update,
                 "episode_reward": episode_rewards / self.train_cfg.episode_length,
+                "win_rate": self._current_win_rate,
             }
             log_data.update(loss_dict)
             self.logger.log(log_data, step=update)
@@ -263,3 +268,22 @@ class MAPPOTrainer:
                         act = valid[0, 0]
                     reshaped[env_idx, agent_idx, 0] = act
         return reshaped.view(-1, 1)
+
+    @property
+    def _current_win_rate(self) -> float:
+        if self._completed_episodes == 0:
+            return 0.0
+        return self._won_episodes / float(self._completed_episodes)
+
+    def _update_win_rate(self, done_np: np.ndarray, info_list: list[dict[str, Any]]) -> None:
+        done_mask = done_np[:, 0] > 0.5
+        for env_idx, done_flag in enumerate(done_mask):
+            if not done_flag:
+                continue
+            self._completed_episodes += 1
+            info = info_list[env_idx] if env_idx < len(info_list) else {}
+            win = info.get("battle_won", 0)
+            if isinstance(win, (list, tuple)):
+                win = win[-1]
+            if float(win) > 0.5:
+                self._won_episodes += 1

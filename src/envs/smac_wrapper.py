@@ -92,12 +92,14 @@ class SMACWrapper:
                         env_actions[agent_id] = np.random.choice(valid)
                     else:
                         env_actions[agent_id] = 0
-            reward, terminated, _ = env.step(env_actions.tolist())
+            reward, terminated, info = env.step(env_actions.tolist())
             reward *= self.cfg.reward_scale
-            try:
-                info = env.get_stats()
-            except ZeroDivisionError:
-                info = {}
+            if terminated:
+                try:
+                    episode_stats = env.get_stats()
+                except ZeroDivisionError:
+                    episode_stats = {}
+                info = {**episode_stats, **(info or {})}
             next_obs = np.stack(env.get_obs())
             state = env.get_state()
             avail = np.stack(env.get_avail_actions())

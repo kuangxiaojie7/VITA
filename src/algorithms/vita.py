@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -26,6 +27,8 @@ class VITATrainParams:
     max_grad_norm: float = 10.0
     trust_warmup_updates: int = 0
     kl_warmup_updates: int = 0
+    trust_delay_updates: int = 0
+    kl_delay_updates: int = 0
 
 
 class VITATrainer:
@@ -77,6 +80,8 @@ class VITATrainer:
         )
         self.obs_history: Deque[torch.Tensor] | None = None
         self._current_update: int = 0
+        self._completed_episodes: int = 0
+        self._won_episodes: int = 0
 
     def train(self) -> None:
         obs_np, state_np, avail_np = self.env.reset()
@@ -131,13 +136,14 @@ class VITATrainer:
                 next_critic = outputs["next_critic_state"]
 
                 env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
-                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, _ = self.env.step(env_actions)
+                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
                 next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
                 next_state = torch.from_numpy(next_state_np).float().to(self.device)
                 next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
                 rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
                 dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                 reward_sum += rewards.mean().item()
+                self._update_win_rate(done_np, info_list)
 
                 next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
                 next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
@@ -194,6 +200,7 @@ class VITATrainer:
             log_payload = {
                 "update": update,
                 "episode_reward": reward_sum / self.train_cfg.episode_length,
+                "win_rate": self._current_win_rate,
                 **loss_dict,
             }
             self.logger.log(log_payload, step=update)
@@ -212,9 +219,13 @@ class VITATrainer:
         trust_epoch = 0.0
         updates = 0
         trust_coeff = self.agent.cfg.trust_lambda * self._schedule_coeff(
-            self._current_update, self.train_cfg.trust_warmup_updates
+            self._current_update - self.train_cfg.trust_delay_updates,
+            self.train_cfg.trust_warmup_updates,
         )
-        kl_coeff = self._schedule_coeff(self._current_update, self.train_cfg.kl_warmup_updates)
+        kl_coeff = self._schedule_coeff(
+            self._current_update - self.train_cfg.kl_delay_updates,
+            self.train_cfg.kl_warmup_updates,
+        )
         for _ in range(self.train_cfg.ppo_epochs):
             for batch in self.buffer.mini_batch_generator(norm_adv, self.train_cfg.num_mini_batch):
                 obs_seq_batch = batch["obs_seq"]
@@ -289,7 +300,7 @@ class VITATrainer:
     @staticmethod
     def _schedule_coeff(update: int, warmup: int) -> float:
         if warmup <= 0:
-            return 1.0
+            return 0.0 if update <= 0 else 1.0
         if update <= warmup:
             return 0.5 * max(0.0, update) / float(warmup)
         extra = min(update - warmup, warmup)
@@ -308,6 +319,25 @@ class VITATrainer:
         assert self.obs_history is not None
         history = torch.stack(list(self.obs_history), dim=0)  # [T, envs, agents, obs_dim]
         return history.permute(1, 2, 0, 3).contiguous()
+
+    @property
+    def _current_win_rate(self) -> float:
+        if self._completed_episodes == 0:
+            return 0.0
+        return self._won_episodes / float(self._completed_episodes)
+
+    def _update_win_rate(self, done_np: np.ndarray, info_list: list[dict[str, Any]]) -> None:
+        done_mask = done_np[:, 0] > 0.5
+        for env_idx, done_flag in enumerate(done_mask):
+            if not done_flag:
+                continue
+            self._completed_episodes += 1
+            info = info_list[env_idx] if env_idx < len(info_list) else {}
+            win = info.get("battle_won", 0)
+            if isinstance(win, (list, tuple)):
+                win = win[-1]
+            if float(win) > 0.5:
+                self._won_episodes += 1
 
     def _select_topk_neighbors(self, obs_seq: torch.Tensor) -> torch.Tensor:
         # obs_seq: [envs, agents, history, obs_dim]

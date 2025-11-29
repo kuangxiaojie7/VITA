@@ -21,14 +21,16 @@ model:
 train:
   episode_length: 120
   updates: 1000
-  lr: 0.0003
+  lr: 0.0002
   gamma: 0.99
   gae_lambda: 0.95
   clip_param: 0.2
   ppo_epochs: 5
   num_mini_batch: 4
-  entropy_coef: 0.01
+  entropy_coef: 0.015
   value_loss_coef: 0.6
   max_grad_norm: 10.0
-  trust_warmup_updates: 400
-  kl_warmup_updates: 300
+  trust_warmup_updates: 600
+  kl_warmup_updates: 400
+  trust_delay_updates: 200
+  kl_delay_updates: 200
