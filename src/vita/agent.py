@@ -82,6 +82,7 @@ class VITAAgent(torch.nn.Module):
         neighbor_feat = self._encode_neighbors(neighbor_seq)
         if self.cfg.enable_trust:
             _, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+            trust_mask = trust_mask.detach()
         else:
             trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
         comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
@@ -129,6 +130,7 @@ class VITAAgent(torch.nn.Module):
         neighbor_feat = self._encode_neighbors(neighbor_seq)
         if self.cfg.enable_trust:
             pred_actions, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+            trust_mask = trust_mask.detach()
         else:
             trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
             pred_actions = neighbor_next_actions
