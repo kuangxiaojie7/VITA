@@ -31,6 +31,7 @@ class VITATrainParams:
     kl_delay_updates: int = 0
     comm_delay_updates: int = 0
     comm_warmup_updates: int = 0
+    comm_full_warmup_updates: int = 0
 
 
 class VITATrainer:
@@ -53,7 +54,6 @@ class VITATrainer:
         self.max_neighbors = self.num_agents - 1 if self.num_agents > 1 else 1
         self.history_length = policy_cfg.get("history_length", 4)
         self.train_cfg = VITATrainParams(**train_cfg)
-        self._neighbor_template = self._build_neighbor_template()
 
         agent_cfg = VITAAgentConfig(
             obs_dim=self.obs_dim,
@@ -100,7 +100,9 @@ class VITATrainer:
         for update in range(1, self.train_cfg.updates + 1):
             self._current_update = update
             comm_elapsed = self._current_update - self.train_cfg.comm_delay_updates
-            comm_coeff = self._schedule_coeff(comm_elapsed, self.train_cfg.comm_warmup_updates)
+            comm_coeff = self._comm_schedule_coeff(
+                comm_elapsed, self.train_cfg.comm_warmup_updates, self.train_cfg.comm_full_warmup_updates
+            )
             self.agent.set_comm_strength(comm_coeff)
             self.agent.set_comm_enabled(comm_coeff > 0.0)
             self.buffer.reset(obs, state, actor_states, critic_states)
@@ -317,6 +319,21 @@ class VITATrainer:
             return 1.0
         return min(1.0, elapsed / float(warmup))
 
+    @staticmethod
+    def _comm_schedule_coeff(elapsed: int, stage_one: int, stage_two: int) -> float:
+        if elapsed <= 0:
+            return 0.0
+        if stage_one > 0 and elapsed <= stage_one:
+            return min(0.5, 0.5 * elapsed / float(stage_one))
+        if stage_one <= 0:
+            base = 0.0
+        else:
+            base = 0.5
+        if stage_two <= 0:
+            return 1.0 if elapsed > stage_one else base
+        extra = max(0.0, min(elapsed - max(stage_one, 0), stage_two))
+        return min(1.0, max(base, 0.5) + 0.5 * (extra / float(stage_two)))
+
     def _initialize_history(self, obs: torch.Tensor) -> None:
         self.obs_history = deque(
             [obs.clone() for _ in range(self.history_length)], maxlen=self.history_length
@@ -330,19 +347,6 @@ class VITATrainer:
         assert self.obs_history is not None
         history = torch.stack(list(self.obs_history), dim=0)  # [T, envs, agents, obs_dim]
         return history.permute(1, 2, 0, 3).contiguous()
-
-    def _build_neighbor_template(self) -> torch.Tensor:
-        template = []
-        for agent_idx in range(self.num_agents):
-            candidates = [j for j in range(self.num_agents) if j != agent_idx]
-            if not candidates:
-                candidates = [agent_idx]
-            if len(candidates) >= self.max_neighbors:
-                template.append(candidates[: self.max_neighbors])
-            else:
-                pad = candidates[-1]
-                template.append(candidates + [pad] * (self.max_neighbors - len(candidates)))
-        return torch.tensor(template, dtype=torch.long)
 
     @property
     def _current_win_rate(self) -> float:
@@ -365,9 +369,15 @@ class VITATrainer:
 
     def _select_topk_neighbors(self, obs_seq: torch.Tensor) -> torch.Tensor:
         # obs_seq: [envs, agents, history, obs_dim]
-        envs = obs_seq.size(0)
-        template = self._neighbor_template.to(obs_seq.device)
-        return template.unsqueeze(0).expand(envs, -1, -1)
+        envs, agents, history_len, obs_dim = obs_seq.shape
+        if agents == 1:
+            return torch.zeros(envs, 1, 1, dtype=torch.long, device=obs_seq.device)
+        latest = obs_seq[:, :, -1, :]
+        dist = torch.cdist(latest, latest, p=2)
+        mask = torch.eye(agents, device=dist.device).unsqueeze(0)
+        dist = dist + mask * 1e9
+        topk = torch.topk(dist, k=self.max_neighbors, dim=-1, largest=False).indices
+        return topk
 
     def _gather_neighbor_sequences(
         self, obs_seq: torch.Tensor, neighbor_idx: torch.Tensor
