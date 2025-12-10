@@ -7,9 +7,7 @@ import torch.nn as nn
 
 
 class VIBGATLayer(nn.Module):
-    """Variational bottleneck + trust-aware attention aggregation."""
-
-    def __init__(self, hidden_dim: int, latent_dim: int, kl_beta: float):
+    def __init__(self, hidden_dim: int, latent_dim: int, kl_beta: float, bias_coef: float):
         super().__init__()
         self.pre_norm = nn.LayerNorm(hidden_dim)
         self.to_mu = nn.Linear(hidden_dim, latent_dim)
@@ -19,6 +17,12 @@ class VIBGATLayer(nn.Module):
         self.key_proj = nn.Linear(latent_dim, latent_dim)
         self.value_proj = nn.Linear(latent_dim, latent_dim)
         self.out_proj = nn.Linear(latent_dim, hidden_dim)
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.bias_coef = bias_coef
         self.kl_beta = kl_beta
 
     def forward(
@@ -26,13 +30,9 @@ class VIBGATLayer(nn.Module):
         self_feat: torch.Tensor,
         neighbor_feat: torch.Tensor,
         trust_mask: torch.Tensor,
+        comm_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            self_feat: [B, hidden_dim]
-            neighbor_feat: [B, K, hidden_dim]
-            trust_mask: [B, K, 1]
-        """
+    
         norm_neighbors = self.pre_norm(neighbor_feat)
         mu = self.to_mu(norm_neighbors)
         logvar = self.to_logvar(norm_neighbors)
@@ -46,9 +46,19 @@ class VIBGATLayer(nn.Module):
         values = self.value_proj(z)
 
         attn_logits = torch.matmul(query, keys.transpose(-2, -1)).squeeze(1) / (keys.size(-1) ** 0.5)
-        attn_logits = attn_logits + torch.log(trust_mask.squeeze(-1) + 1e-6)
-        attn_weights = torch.softmax(attn_logits, dim=-1).unsqueeze(-2)
-        context = torch.matmul(attn_weights, values).squeeze(-2)
+        bias_input = torch.abs(self_feat.unsqueeze(1) - neighbor_feat)
+        bias = self.bias_mlp(bias_input).squeeze(-1)
+        attn_logits = attn_logits - self.bias_coef * bias
+        trust_term = torch.log(trust_mask.squeeze(-1) + 1e-6)
+        attn_logits = attn_logits + trust_term
+        neighbor_mask = comm_mask.squeeze(-1)
+        attn_logits = attn_logits.masked_fill(neighbor_mask < 0.5, -1e9)
+        attn_weights = torch.softmax(attn_logits, dim=-1)
+        attn_weights = attn_weights * neighbor_mask
+        norm = attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        attn_weights = (attn_weights / norm).unsqueeze(-2)
+        weighted_values = values * comm_mask
+        context = torch.matmul(attn_weights, weighted_values).squeeze(-2)
         comm_feat = self.out_proj(context)
 
         kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()

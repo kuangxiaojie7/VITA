@@ -54,6 +54,9 @@ class SMACWrapper:
         self.obs_dim = self.envs[0].get_obs_size()
         self.state_dim = self.envs[0].get_state_size()
         self.action_dim = self.envs[0].n_actions
+        self._last_positions: np.ndarray | None = None
+        self._alive_mask: np.ndarray | None = None
+        self._sight_ranges = self._compute_sight_ranges()
 
     def reset(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         obs, states, avails = [], [], []
@@ -66,6 +69,7 @@ class SMACWrapper:
         states = np.stack(states)
         avail = np.stack(avails)
         obs = self._process_obs(obs)
+        self._update_agent_metadata()
         return obs, states, avail
 
     def step(
@@ -113,6 +117,7 @@ class SMACWrapper:
                 env.reset()
         next_obs = np.stack(next_obs_list)
         next_obs = self._process_obs(next_obs)
+        self._update_agent_metadata()
         return (
             next_obs,
             np.stack(state_list),
@@ -134,6 +139,47 @@ class SMACWrapper:
             drop_mask = np.random.rand(*obs.shape[:2]) < self.cfg.packet_drop_prob
             obs[drop_mask] = 0.0
         return obs
+
+    def _compute_sight_ranges(self) -> np.ndarray:
+        if not self.envs:
+            return np.zeros(0, dtype=np.float32)
+        ranges = np.zeros(self.n_agents, dtype=np.float32)
+        ref_env = self.envs[0]
+        for agent_id in range(self.n_agents):
+            ranges[agent_id] = float(ref_env.unit_sight_range(agent_id))
+        return ranges
+
+    def _update_agent_metadata(self) -> None:
+        positions = np.zeros((self.cfg.num_envs, self.n_agents, 2), dtype=np.float32)
+        alive = np.zeros((self.cfg.num_envs, self.n_agents), dtype=np.float32)
+        for env_idx, env in enumerate(self.envs):
+            for agent_id in range(self.n_agents):
+                try:
+                    unit = env.get_unit_by_id(agent_id)
+                except KeyError:
+                    continue
+                if unit is None:
+                    continue
+                positions[env_idx, agent_id, 0] = float(getattr(unit.pos, "x", 0.0))
+                positions[env_idx, agent_id, 1] = float(getattr(unit.pos, "y", 0.0))
+                alive[env_idx, agent_id] = 1.0 if getattr(unit, "health", 0.0) > 0 else 0.0
+        self._last_positions = positions
+        self._alive_mask = alive
+
+    def get_agent_positions(self) -> np.ndarray:
+        if self._last_positions is None:
+            self._update_agent_metadata()
+        assert self._last_positions is not None
+        return self._last_positions.copy()
+
+    def get_agent_alive_mask(self) -> np.ndarray:
+        if self._alive_mask is None:
+            self._update_agent_metadata()
+        assert self._alive_mask is not None
+        return self._alive_mask.copy()
+
+    def get_sight_ranges(self) -> np.ndarray:
+        return self._sight_ranges.copy()
 
 
 def make_smac_env(cfg_dict: Dict[str, Any]) -> SMACWrapper:

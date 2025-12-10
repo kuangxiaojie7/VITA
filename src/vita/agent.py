@@ -24,6 +24,8 @@ class VITAAgentConfig:
     comm_dropout: float = 0.1
     enable_trust: bool = True
     enable_kl: bool = True
+    trust_threshold: float = 0.0
+    attn_bias_coef: float = 1.0
 
 
 class VITAAgent(torch.nn.Module):
@@ -32,8 +34,9 @@ class VITAAgent(torch.nn.Module):
         self.cfg = cfg
         self.actor_encoder = FeatureEncoder(cfg.obs_dim, cfg.hidden_dim)
         self.critic_encoder = FeatureEncoder(cfg.state_dim, cfg.hidden_dim)
+        self.comm_encoder = FeatureEncoder(cfg.obs_dim, cfg.hidden_dim)
         self.trust_predictor = TrustPredictor(cfg.hidden_dim, cfg.action_dim, cfg.trust_gamma)
-        self.vib_gat = VIBGATLayer(cfg.hidden_dim, cfg.latent_dim, cfg.kl_beta)
+        self.vib_gat = VIBGATLayer(cfg.hidden_dim, cfg.latent_dim, cfg.kl_beta, cfg.attn_bias_coef)
         self.residual = GatedResidualBlock(cfg.hidden_dim)
         self.neighbor_norm = torch.nn.LayerNorm(cfg.hidden_dim)
         self.comm_dropout = torch.nn.Dropout(cfg.comm_dropout)
@@ -46,6 +49,7 @@ class VITAAgent(torch.nn.Module):
         self.value_head = torch.nn.Linear(cfg.hidden_dim, 1)
         self.comm_enabled = True
         self.comm_strength = 0.0
+        self.trust_active = False
 
     def set_comm_enabled(self, enabled: bool) -> None:
         self.comm_enabled = enabled
@@ -56,6 +60,9 @@ class VITAAgent(torch.nn.Module):
         strength = float(max(0.0, min(1.0, strength)))
         self.comm_strength = strength
 
+    def set_trust_active(self, active: bool) -> None:
+        self.trust_active = bool(active and self.cfg.enable_trust)
+
     @property
     def rnn_hidden_dim(self) -> int:
         return self.cfg.hidden_dim
@@ -64,7 +71,7 @@ class VITAAgent(torch.nn.Module):
         # neighbor_seq: [B, K, T, obs_dim]
         B, K, T, D = neighbor_seq.shape
         flat = neighbor_seq.view(B * K, T, D)
-        feat, _ = self.actor_encoder(flat, None, None)
+        feat, _ = self.comm_encoder(flat, None, None)
         feat = self.neighbor_norm(feat)
         return feat.view(B, K, -1)
 
@@ -82,6 +89,7 @@ class VITAAgent(torch.nn.Module):
         obs_seq: torch.Tensor,
         state: torch.Tensor,
         neighbor_seq: torch.Tensor,
+        neighbor_mask: torch.Tensor | None,
         neighbor_next_actions: torch.Tensor | None,
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
@@ -90,16 +98,29 @@ class VITAAgent(torch.nn.Module):
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
         self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
-        neighbor_feat = self._encode_neighbors(neighbor_seq)
-        if self.cfg.enable_trust:
-            _, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
-            trust_mask = trust_mask.detach()
-        else:
-            trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
-        comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
-        if not self.cfg.enable_kl:
+        if (not self.comm_enabled) or (self.comm_strength <= 0.0):
+            comm_feat = torch.zeros_like(self_feat)
             kl_loss = torch.zeros(1, device=self_feat.device)
-        comm_feat = self.comm_dropout(comm_feat)
+        else:
+            neighbor_feat = self._encode_neighbors(neighbor_seq)
+            if neighbor_mask is None:
+                neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
+            comm_mask = neighbor_mask.float()
+            use_trust = self.cfg.enable_trust and self.trust_active
+            if use_trust:
+                _, trust_scores = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+                trust_scores = trust_scores.detach()
+            else:
+                trust_scores = torch.ones_like(comm_mask)
+            if use_trust and self.cfg.trust_threshold > 0.0:
+                trust_gate = (trust_scores >= self.cfg.trust_threshold).float()
+                comm_mask = comm_mask * trust_gate
+            neighbor_feat = neighbor_feat * comm_mask
+            trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask)
+            if not self.cfg.enable_kl:
+                kl_loss = torch.zeros(1, device=self_feat.device)
+            comm_feat = self.comm_dropout(comm_feat)
         fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
@@ -130,6 +151,7 @@ class VITAAgent(torch.nn.Module):
         obs_seq: torch.Tensor,
         state: torch.Tensor,
         neighbor_seq: torch.Tensor,
+        neighbor_mask: torch.Tensor | None,
         neighbor_next_actions: torch.Tensor,
         actions: torch.Tensor,
         rnn_states_actor: torch.Tensor,
@@ -138,17 +160,35 @@ class VITAAgent(torch.nn.Module):
         avail_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         self_feat, _ = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
-        neighbor_feat = self._encode_neighbors(neighbor_seq)
-        if self.cfg.enable_trust:
-            pred_actions, trust_mask = self.trust_predictor(neighbor_feat, neighbor_next_actions)
-            trust_mask = trust_mask.detach()
-        else:
-            trust_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
-            pred_actions = neighbor_next_actions
-        comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_mask)
-        if not self.cfg.enable_kl:
+        if (not self.comm_enabled) or (self.comm_strength <= 0.0):
+            comm_feat = torch.zeros_like(self_feat)
             kl_loss = torch.zeros(1, device=self_feat.device)
-        comm_feat = self.comm_dropout(comm_feat)
+            trust_loss = torch.zeros(1, device=obs_seq.device)
+        else:
+            neighbor_feat = self._encode_neighbors(neighbor_seq)
+            if neighbor_mask is None:
+                neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
+            comm_mask = neighbor_mask.float()
+            use_trust = self.cfg.enable_trust and self.trust_active
+            if use_trust:
+                pred_actions, trust_scores = self.trust_predictor(neighbor_feat, neighbor_next_actions)
+                trust_scores = trust_scores.detach()
+            else:
+                trust_scores = torch.ones_like(comm_mask)
+                pred_actions = neighbor_next_actions
+            if use_trust and self.cfg.trust_threshold > 0.0:
+                trust_gate = (trust_scores >= self.cfg.trust_threshold).float()
+                comm_mask = comm_mask * trust_gate
+            neighbor_feat = neighbor_feat * comm_mask
+            trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask)
+            if not self.cfg.enable_kl:
+                kl_loss = torch.zeros(1, device=self_feat.device)
+            comm_feat = self.comm_dropout(comm_feat)
+            if use_trust:
+                trust_loss = F.mse_loss(pred_actions * comm_mask, neighbor_next_actions * comm_mask)
+            else:
+                trust_loss = torch.zeros(1, device=obs_seq.device)
         fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
@@ -159,11 +199,6 @@ class VITAAgent(torch.nn.Module):
         critic_feat, _ = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
         critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
-        if self.cfg.enable_trust:
-            trust_loss = F.mse_loss(pred_actions, neighbor_next_actions)
-        else:
-            trust_loss = torch.zeros(1, device=obs_seq.device)
-
         return {
             "log_probs": log_probs,
             "entropy": entropy,

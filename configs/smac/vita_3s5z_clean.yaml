@@ -12,12 +12,15 @@ env:
 model:
   hidden_dim: 192
   latent_dim: 96
-  trust_gamma: 1.5
+  trust_gamma: 1.0
   kl_beta: 0.0005
+  attn_bias_coef: 0.75
   trust_lambda: 0.15
+  trust_threshold: 0.3
   comm_dropout: 0.1
-  enable_trust: false
+  enable_trust: true
   enable_kl: false
+  comm_sight_range: 5
   max_neighbors: 4
   history_length: 4
 train:
@@ -32,10 +35,10 @@ train:
   entropy_coef: 0.008
   value_loss_coef: 0.6
   max_grad_norm: 10.0
-  trust_warmup_updates: 0
+  trust_warmup_updates: 100
   kl_warmup_updates: 0
-  trust_delay_updates: 0
+  trust_delay_updates: 200
   kl_delay_updates: 0
-  comm_delay_updates: 80
-  comm_warmup_updates: 150
-  comm_full_warmup_updates: 200
+  comm_delay_updates: 120
+  comm_warmup_updates: 180
+  comm_full_warmup_updates: 240

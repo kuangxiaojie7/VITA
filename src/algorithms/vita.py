@@ -51,7 +51,12 @@ class VITATrainer:
         self.obs_dim = env.obs_dim
         self.state_dim = env.state_dim
         self.action_dim = env.action_dim
-        self.max_neighbors = self.num_agents - 1 if self.num_agents > 1 else 1
+        default_neighbors = self.num_agents - 1 if self.num_agents > 1 else 1
+        cfg_neighbors = policy_cfg.get("max_neighbors", default_neighbors)
+        if cfg_neighbors is None:
+            cfg_neighbors = default_neighbors
+        cfg_neighbors = max(1, int(cfg_neighbors))
+        self.max_neighbors = min(default_neighbors, cfg_neighbors)
         self.history_length = policy_cfg.get("history_length", 4)
         self.train_cfg = VITATrainParams(**train_cfg)
 
@@ -64,11 +69,25 @@ class VITATrainer:
             trust_gamma=policy_cfg.get("trust_gamma", 1.0),
             kl_beta=policy_cfg.get("kl_beta", 1e-3),
             trust_lambda=policy_cfg.get("trust_lambda", 0.1),
+            comm_dropout=policy_cfg.get("comm_dropout", 0.1),
+            enable_trust=policy_cfg.get("enable_trust", True),
+            enable_kl=policy_cfg.get("enable_kl", True),
+            trust_threshold=policy_cfg.get("trust_threshold", 0.0),
+            attn_bias_coef=policy_cfg.get("attn_bias_coef", 1.0),
             max_neighbors=self.max_neighbors,
         )
         self.agent = VITAAgent(agent_cfg).to(device)
         self.agent.set_comm_enabled(False)
         self.agent.set_comm_strength(0.0)
+        sight_ranges = torch.from_numpy(self.env.get_sight_ranges()).float()
+        override_range = policy_cfg.get("comm_sight_range")
+        if override_range is not None:
+            override_range = float(override_range)
+            if override_range > 0:
+                sight_ranges = torch.full_like(sight_ranges, override_range)
+        self.comm_range = sight_ranges.to(device)
+        self.current_positions = torch.zeros(self.num_envs, self.num_agents, 2, device=device)
+        self.current_alive_mask = torch.ones(self.num_envs, self.num_agents, device=device)
         self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.train_cfg.lr, eps=1e-8)
         self.buffer = MAPPOBuffer(
             self.train_cfg.episode_length,
@@ -96,6 +115,7 @@ class VITATrainer:
         critic_states = torch.zeros_like(actor_states)
         masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
         self._initialize_history(obs)
+        self._refresh_env_metadata()
 
         for update in range(1, self.train_cfg.updates + 1):
             self._current_update = update
@@ -105,6 +125,9 @@ class VITATrainer:
             )
             self.agent.set_comm_strength(comm_coeff)
             self.agent.set_comm_enabled(comm_coeff > 0.0)
+            trust_elapsed = self._current_update - self.train_cfg.trust_delay_updates
+            trust_gate = self._schedule_coeff(trust_elapsed, self.train_cfg.trust_warmup_updates)
+            self.agent.set_trust_active(trust_gate > 0.0)
             self.buffer.reset(obs, state, actor_states, critic_states)
             reward_sum = 0.0
             for step in range(self.train_cfg.episode_length):
@@ -112,8 +135,9 @@ class VITATrainer:
                 obs = obs.float()
                 state = state.float()
                 avail_actions = avail_actions.float()
-                neighbor_indices = self._select_topk_neighbors(obs_seq)
+                neighbor_indices, neighbor_mask = self._select_topk_neighbors(self.current_positions, self.current_alive_mask)
                 neighbor_seq = self._gather_neighbor_sequences(obs_seq, neighbor_indices).contiguous()
+                neighbor_mask = neighbor_mask.to(obs_seq.device).detach()
                 flat_obs_seq = obs_seq.view(self.num_envs * self.num_agents, self.history_length, self.obs_dim).float()
                 flat_state = (
                     state.unsqueeze(1)
@@ -124,6 +148,9 @@ class VITATrainer:
                 flat_neighbor_seq = neighbor_seq.view(
                     self.num_envs * self.num_agents, self.max_neighbors, self.history_length, self.obs_dim
                 ).float()
+                flat_neighbor_mask = neighbor_mask.view(
+                    self.num_envs * self.num_agents, self.max_neighbors, 1
+                ).float()
                 flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
                 flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
                 flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
@@ -133,6 +160,7 @@ class VITATrainer:
                     flat_obs_seq,
                     flat_state,
                     flat_neighbor_seq,
+                    flat_neighbor_mask,
                     None,
                     flat_actor,
                     flat_critic,
@@ -150,6 +178,7 @@ class VITATrainer:
                 next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
                 next_state = torch.from_numpy(next_state_np).float().to(self.device)
                 next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
+                self._refresh_env_metadata()
                 rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
                 dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                 reward_sum += rewards.mean().item()
@@ -183,6 +212,7 @@ class VITATrainer:
                     obs_seq,
                     neighbor_seq,
                     avail_actions,
+                    neighbor_mask,
                 )
 
                 obs = next_obs
@@ -253,11 +283,13 @@ class VITATrainer:
                 rnn_critic_batch = batch["rnn_states_critic"]
                 neighbor_obs_seq_batch = batch["neighbor_obs_seq"]
                 neighbor_actions_batch = batch["neighbor_actions"]
+                neighbor_mask_batch = batch["neighbor_masks"]
                 avail_batch = batch["avail_actions"]
                 eval_out = self.agent.evaluate_actions(
                     obs_seq_batch.float(),
                     state_batch.float(),
                     neighbor_obs_seq_batch.float(),
+                    neighbor_mask_batch.float(),
                     neighbor_actions_batch.float(),
                     actions_batch,
                     rnn_actor_batch.float(),
@@ -343,6 +375,12 @@ class VITATrainer:
         assert self.obs_history is not None
         self.obs_history.append(obs.clone())
 
+    def _refresh_env_metadata(self) -> None:
+        positions = torch.from_numpy(self.env.get_agent_positions()).float().to(self.device)
+        alive = torch.from_numpy(self.env.get_agent_alive_mask()).float().to(self.device)
+        self.current_positions = positions
+        self.current_alive_mask = alive
+
     def _stack_history(self) -> torch.Tensor:
         assert self.obs_history is not None
         history = torch.stack(list(self.obs_history), dim=0)  # [T, envs, agents, obs_dim]
@@ -367,17 +405,27 @@ class VITATrainer:
             if float(win) > 0.5:
                 self._won_episodes += 1
 
-    def _select_topk_neighbors(self, obs_seq: torch.Tensor) -> torch.Tensor:
-        # obs_seq: [envs, agents, history, obs_dim]
-        envs, agents, history_len, obs_dim = obs_seq.shape
+    def _select_topk_neighbors(self, positions: torch.Tensor, alive_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # positions: [envs, agents, 2]
+        envs, agents, _ = positions.shape
         if agents == 1:
-            return torch.zeros(envs, 1, 1, dtype=torch.long, device=obs_seq.device)
-        latest = obs_seq[:, :, -1, :]
-        dist = torch.cdist(latest, latest, p=2)
-        mask = torch.eye(agents, device=dist.device).unsqueeze(0)
+            idx = torch.zeros(envs, 1, 1, dtype=torch.long, device=positions.device)
+            return idx, torch.zeros(envs, 1, 1, 1, device=positions.device)
+        dist = torch.cdist(positions, positions, p=2)
+        mask = torch.eye(agents, device=positions.device).unsqueeze(0)
         dist = dist + mask * 1e9
         topk = torch.topk(dist, k=self.max_neighbors, dim=-1, largest=False).indices
-        return topk
+        neighbor_pos = self._gather_neighbor_positions(positions, topk)
+        self_pos = positions.unsqueeze(2).expand_as(neighbor_pos)
+        dists = torch.norm(neighbor_pos - self_pos, dim=-1)
+        range_tensor = self.comm_range.view(1, agents, 1)
+        if range_tensor.device != positions.device:
+            range_tensor = range_tensor.to(positions.device)
+        sight_mask = (dists <= range_tensor + 1e-6).float()
+        neighbor_alive = self._gather_neighbor_scalars(alive_mask, topk)
+        self_alive = alive_mask.unsqueeze(-1).expand_as(neighbor_alive)
+        combined = sight_mask * neighbor_alive * self_alive
+        return topk, combined.unsqueeze(-1)
 
     def _gather_neighbor_sequences(
         self, obs_seq: torch.Tensor, neighbor_idx: torch.Tensor
@@ -402,6 +450,21 @@ class VITATrainer:
         idx = neighbor_idx.unsqueeze(-1).expand(envs, agents, self.max_neighbors, action_dim)
         gathered = torch.gather(expanded, 2, idx)
         return gathered.contiguous()
+
+    def _gather_neighbor_positions(
+        self, positions: torch.Tensor, neighbor_idx: torch.Tensor
+    ) -> torch.Tensor:
+        envs, agents, feat_dim = positions.shape
+        expanded = positions.unsqueeze(1).expand(envs, agents, agents, feat_dim)
+        idx = neighbor_idx.unsqueeze(-1).expand(envs, agents, self.max_neighbors, feat_dim)
+        return torch.gather(expanded, 2, idx).contiguous()
+
+    def _gather_neighbor_scalars(
+        self, values: torch.Tensor, neighbor_idx: torch.Tensor
+    ) -> torch.Tensor:
+        envs, agents = values.shape
+        expanded = values.unsqueeze(1).expand(envs, agents, agents)
+        return torch.gather(expanded, 2, neighbor_idx).contiguous()
 
     def _ensure_valid_actions(self, actions: torch.Tensor, avail_actions: torch.Tensor) -> torch.Tensor:
         reshaped = actions.view(self.num_envs, self.num_agents, -1).clone()

@@ -21,6 +21,7 @@ class EpisodeBatch:
     neighbor_obs: torch.Tensor
     neighbor_actions: torch.Tensor
     neighbor_obs_seq: torch.Tensor
+    neighbor_masks: torch.Tensor
     avail_actions: torch.Tensor
 
 
@@ -69,6 +70,9 @@ class MAPPOBuffer:
         )
         self.neighbor_actions = torch.zeros(
             episode_length, num_envs, num_agents, max_neighbors, action_dim, device=device
+        )
+        self.neighbor_masks = torch.ones(
+            episode_length, num_envs, num_agents, max_neighbors, 1, device=device
         )
         self.avail_actions = torch.zeros(
             episode_length, num_envs, num_agents, action_dim, device=device
@@ -121,6 +125,7 @@ class MAPPOBuffer:
         obs_seq: torch.Tensor,
         neighbor_obs_seq: torch.Tensor,
         avail_actions: torch.Tensor,
+        neighbor_masks: torch.Tensor | None = None,
     ) -> None:
         self.obs[self.step + 1].copy_(next_obs)
         self.states[self.step + 1].copy_(next_state)
@@ -131,8 +136,11 @@ class MAPPOBuffer:
         self.values[self.step].copy_(values)
         self.rewards[self.step].copy_(rewards)
         self.masks[self.step + 1].copy_(1.0 - dones)
+        if neighbor_masks is None:
+            neighbor_masks = torch.ones_like(self.neighbor_masks[self.step])
         self.neighbor_obs[self.step].copy_(neighbor_obs)
         self.neighbor_actions[self.step].copy_(neighbor_actions)
+        self.neighbor_masks[self.step].copy_(neighbor_masks)
         self.obs_sequences[self.step].copy_(obs_seq)
         self.neighbor_obs_sequences[self.step].copy_(neighbor_obs_seq)
         self.avail_actions[self.step].copy_(avail_actions)
@@ -175,6 +183,7 @@ class MAPPOBuffer:
             neighbor_obs=self.neighbor_obs.clone(),
             neighbor_actions=self.neighbor_actions.clone(),
             neighbor_obs_seq=self.neighbor_obs_sequences.clone(),
+            neighbor_masks=self.neighbor_masks.clone(),
             avail_actions=self.avail_actions.clone(),
         )
 
@@ -198,6 +207,9 @@ class MAPPOBuffer:
         )
         neighbor_actions = self.neighbor_actions.reshape(
             episode_length * num_envs * num_agents, self.max_neighbors, self.action_dim
+        )
+        neighbor_masks = self.neighbor_masks.reshape(
+            episode_length * num_envs * num_agents, self.max_neighbors, 1
         )
         avail_actions = self.avail_actions.reshape(
             episode_length * num_envs * num_agents, self.action_dim
@@ -232,5 +244,6 @@ class MAPPOBuffer:
                 "neighbor_obs": neighbor_obs[mb_idx],
                 "neighbor_actions": neighbor_actions[mb_idx],
                 "neighbor_obs_seq": neighbor_obs_seq[mb_idx],
+                "neighbor_masks": neighbor_masks[mb_idx],
                 "avail_actions": avail_actions[mb_idx],
             }
