@@ -4,8 +4,8 @@
 
 - 统一训练入口 `src/main.py`，通过 YAML 配置切换 MAPPO / VITA。
 - `src/vita/` 下的模块化实现严格对应 Plan.md：`components/feature_encoder.py`（局部编码）、`trust_predictor.py`（自监督信任）、`vib_gat.py`（信息瓶颈 + 注意力）和 `residual_policy.py`（门控残差），最终由 `agent.py` 组装。
-- KL/信任正则化的 PPO 训练器（VITA）与标准 MAPPO 训练器共享同一个 rollout buffer。
-- SMAC 封装支持高斯噪声、丢包和恶意队友，方便构造压力测试。
+- KL/信任正则化的 PPO 训练器（VITA）与标准 MAPPO 训练器共享同一个 rollout buffer；信任和通信都支持“延迟+分段 warmup”调度。
+- SMAC 封装支持高斯噪声、丢包、恶意队友以及按视距设置的通信掩码 (`comm_sight_range`)，方便构造压力测试。
 - 自带日志、配置加载器与 `tools/plot_training.py` 可视化脚本。
 
 ## 环境准备
@@ -80,14 +80,14 @@ python tools/plot_training.py \
 ## 配置说明
 
 - `configs/smac/mappo_3s5z.yaml`：SMAC 3s5z 标准场景，`history_length=1`，128 维循环策略。
-- `configs/smac/vita_3s5z_noise.yaml`：同一地图但附加高斯噪声（0.1）、丢包率（0.1）和恶意队友（5%）。`history_length=4` 用于构造观测序列，`trust_gamma=2.0` 控制信任衰减，`trust_lambda=0.5` 权衡监督强度。
+- `configs/smac/vita_3s5z_noise.yaml`：同一地图但附加高斯噪声（0.1）、丢包率（0.1）和恶意队友（5%）。`history_length=4` 用于构造观测序列，`comm_sight_range=5` + `max_neighbors=4` 将通信限制在视距内，`trust_threshold=0.3`、`trust_lambda=0.15`、`trust_gamma=1.0` 组成默认的信任门控；`enable_trust=true`、`enable_kl=false` 配合 `trust_delay_updates=200`、`comm_delay_updates=120` 及分段 warmup，让信任/通信在策略初步稳定后逐步放开。
 
 可直接修改 YAML 中的噪声、`max_neighbors`、`history_length` 等字段，快速生成新的干扰组合。
 
 ## MAPPO vs. VITA
 
-- **架构**：VITA 在局部编码后串联自监督信任预测、变分信息瓶颈 GAT 与门控残差，确保与独立学习相同的性能下界；MAPPO 仅使用常规集中式 actor-critic。
-- **损失**：VITA 的 PPO 目标额外包含 KL 正则与 `exp(-γ·MSE)` 信任监督，对噪声/恶意代理更鲁棒。
+- **架构**：VITA 在局部编码后串联自监督信任预测、变分信息瓶颈 GAT 与门控残差，并结合视距掩码 + `trust_threshold` 做通信裁剪；MAPPO 仅使用常规集中式 actor-critic。
+- **损失/调度**：VITA 的 PPO 目标额外包含 KL 与信任监督，可分别通过 `enable_kl`/`enable_trust` 与延迟-warmup 调度控制生效时机，对噪声/恶意代理更鲁棒。
 - **数据处理**：VITA 的 rollout buffer 记录邻居观测序列、邻居动作序列以及 Top-K 邻居索引，供信任模块学习；MAPPO 只消费单步观测。
 
 ## 目录结构
