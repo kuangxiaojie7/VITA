@@ -26,3 +26,5 @@ train:
   entropy_coef: 0.01
   value_loss_coef: 0.5
   max_grad_norm: 10.0
+  eval_interval_updates: 20
+  eval_episodes: 32

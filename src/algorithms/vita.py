@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Deque, Dict, Any
 
 import numpy as np
@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from src.vita import VITAAgent, VITAAgentConfig
 from src.utils import Logger, MAPPOBuffer
+from src.envs import make_smac_env
 
 
 @dataclass
@@ -32,6 +33,8 @@ class VITATrainParams:
     comm_delay_updates: int = 0
     comm_warmup_updates: int = 0
     comm_full_warmup_updates: int = 0
+    eval_interval_updates: int = 0
+    eval_episodes: int = 0
 
 
 class VITATrainer:
@@ -105,18 +108,25 @@ class VITATrainer:
         self._current_update: int = 0
         self._completed_episodes: int = 0
         self._won_episodes: int = 0
+        self.eval_env = None
+        if self.train_cfg.eval_interval_updates > 0 and self.train_cfg.eval_episodes > 0:
+            eval_cfg = asdict(self.env.cfg)
+            eval_cfg["num_envs"] = 1
+            self.eval_env = make_smac_env(eval_cfg)
 
-    def train(self) -> None:
-        obs_np, state_np, avail_np = self.env.reset()
-        obs = torch.from_numpy(obs_np).to(self.device).float()
-        state = torch.from_numpy(state_np).to(self.device).float()
-        avail_actions = torch.from_numpy(avail_np).to(self.device).float()
-        actor_states = torch.zeros(self.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
-        critic_states = torch.zeros_like(actor_states)
-        masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
-        self._initialize_history(obs)
-        self._refresh_env_metadata()
 
+def train(self) -> None:
+    obs_np, state_np, avail_np = self.env.reset()
+    obs = torch.from_numpy(obs_np).to(self.device).float()
+    state = torch.from_numpy(state_np).to(self.device).float()
+    avail_actions = torch.from_numpy(avail_np).to(self.device).float()
+    actor_states = torch.zeros(self.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
+    critic_states = torch.zeros_like(actor_states)
+    masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
+    self._initialize_history(obs)
+    self._refresh_env_metadata()
+
+    try:
         for update in range(1, self.train_cfg.updates + 1):
             self._current_update = update
             comm_elapsed = self._current_update - self.train_cfg.comm_delay_updates
@@ -182,7 +192,6 @@ class VITATrainer:
                 rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
                 dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                 reward_sum += rewards.mean().item()
-                self._update_win_rate(done_np, info_list)
 
                 next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
                 next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
@@ -237,14 +246,20 @@ class VITATrainer:
             self.buffer.compute_returns(next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
             loss_dict = self.update_policy()
 
+            eval_metrics = {}
+            if self._should_run_eval(update):
+                eval_metrics = self._run_evaluation()
+
             log_payload = {
                 "update": update,
                 "episode_reward": reward_sum / self.train_cfg.episode_length,
-                "win_rate": self._current_win_rate,
                 **loss_dict,
+                **eval_metrics,
             }
             self.logger.log(log_payload, step=update)
             print(f"[VITA] update {update} completed")
+    finally:
+        self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
         advantages = self.buffer.advantages[:-1]
@@ -386,24 +401,125 @@ class VITATrainer:
         history = torch.stack(list(self.obs_history), dim=0)  # [T, envs, agents, obs_dim]
         return history.permute(1, 2, 0, 3).contiguous()
 
-    @property
-    def _current_win_rate(self) -> float:
-        if self._completed_episodes == 0:
-            return 0.0
-        return self._won_episodes / float(self._completed_episodes)
+    def _stack_history_from(self, history: Deque[torch.Tensor]) -> torch.Tensor:
+        stacked = torch.stack(list(history), dim=0)
+        return stacked.permute(1, 2, 0, 3).contiguous()
 
-    def _update_win_rate(self, done_np: np.ndarray, info_list: list[dict[str, Any]]) -> None:
-        done_mask = done_np[:, 0] > 0.5
-        for env_idx, done_flag in enumerate(done_mask):
-            if not done_flag:
-                continue
-            self._completed_episodes += 1
-            info = info_list[env_idx] if env_idx < len(info_list) else {}
-            win = info.get("battle_won", 0)
-            if isinstance(win, (list, tuple)):
-                win = win[-1]
-            if float(win) > 0.5:
-                self._won_episodes += 1
+    def _should_run_eval(self, update: int) -> bool:
+        return (
+            self.eval_env is not None
+            and self.train_cfg.eval_interval_updates > 0
+            and self.train_cfg.eval_episodes > 0
+            and update % self.train_cfg.eval_interval_updates == 0
+        )
+
+    def _run_evaluation(self) -> Dict[str, float]:
+        if self.eval_env is None:
+            return {}
+        env = self.eval_env
+        eval_rewards: list[float] = []
+        wins = 0
+        total = 0
+        self._won_episodes = 0
+        self._completed_episodes = 0
+        train_mode = self.agent.training
+        self.agent.eval()
+        saved_history = self.obs_history
+        try:
+            for _ in range(self.train_cfg.eval_episodes):
+                obs_np, state_np, avail_np = env.reset()
+                obs = torch.from_numpy(obs_np).float().to(self.device)
+                state = torch.from_numpy(state_np).float().to(self.device)
+                avail_actions = torch.from_numpy(avail_np).float().to(self.device)
+                history = deque([obs.clone() for _ in range(self.history_length)], maxlen=self.history_length)
+                actor_states = torch.zeros(env.cfg.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
+                critic_states = torch.zeros_like(actor_states)
+                masks = torch.ones(env.cfg.num_envs, self.num_agents, 1, device=self.device)
+                episode_return = 0.0
+                done_flag = False
+                while not done_flag:
+                    obs_seq = self._stack_history_from(history)
+                    positions = torch.from_numpy(env.get_agent_positions()).float().to(self.device)
+                    alive = torch.from_numpy(env.get_agent_alive_mask()).float().to(self.device)
+                    neighbor_indices, neighbor_mask = self._select_topk_neighbors(positions, alive)
+                    neighbor_seq = self._gather_neighbor_sequences(obs_seq, neighbor_indices).contiguous()
+                    neighbor_mask = neighbor_mask.to(obs_seq.device)
+                    flat_obs_seq = obs_seq.view(env.cfg.num_envs * self.num_agents, self.history_length, self.obs_dim).float()
+                    flat_state = (
+                        state.unsqueeze(1)
+                        .repeat(1, self.num_agents, 1)
+                        .view(env.cfg.num_envs * self.num_agents, self.state_dim)
+                    ).float()
+                    flat_neighbor_seq = neighbor_seq.view(
+                        env.cfg.num_envs * self.num_agents,
+                        self.max_neighbors,
+                        self.history_length,
+                        self.obs_dim,
+                    ).float()
+                    flat_neighbor_mask = neighbor_mask.view(
+                        env.cfg.num_envs * self.num_agents, self.max_neighbors, 1
+                    ).float()
+                    flat_actor = actor_states.view(env.cfg.num_envs * self.num_agents, -1).float()
+                    flat_critic = critic_states.view(env.cfg.num_envs * self.num_agents, -1).float()
+                    flat_masks = masks.view(env.cfg.num_envs * self.num_agents, 1).float()
+                    flat_avail = avail_actions.view(env.cfg.num_envs * self.num_agents, self.action_dim).float()
+                    with torch.no_grad():
+                        outputs = self.agent.act(
+                            flat_obs_seq,
+                            flat_state,
+                            flat_neighbor_seq,
+                            flat_neighbor_mask,
+                            None,
+                            flat_actor,
+                            flat_critic,
+                            flat_masks,
+                            flat_avail,
+                            deterministic=True,
+                        )
+                    actions = outputs["actions"]
+                    next_actor = outputs["next_actor_state"]
+                    next_critic = outputs["next_critic_state"]
+                    env_actions = actions.view(env.cfg.num_envs, self.num_agents).cpu().numpy()
+                    next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = env.step(env_actions)
+                    next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
+                    state = torch.from_numpy(next_state_np).float().to(self.device)
+                    rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    avail_actions = torch.from_numpy(next_avail_np).float().to(self.device)
+                    actor_states = next_actor.view(env.cfg.num_envs, self.num_agents, -1).detach()
+                    critic_states = next_critic.view(env.cfg.num_envs, self.num_agents, -1).detach()
+                    masks = 1.0 - torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
+                    history.append(next_obs)
+                    episode_return += rewards.mean().item()
+                    done_flag = bool(done_np[0, 0] > 0.5)
+                    if done_flag:
+                        info = info_list[0] if info_list else {}
+                        win = info.get("battle_won", 0)
+                        if isinstance(win, (list, tuple)):
+                            win = win[-1]
+                        if float(win) > 0.5:
+                            wins += 1
+                            self._won_episodes += 1
+                        self._completed_episodes += 1
+                        total += 1
+                        eval_rewards.append(episode_return / self.train_cfg.episode_length)
+        finally:
+            self.agent.train(train_mode)
+            self.obs_history = saved_history
+        eval_win_rate = wins / float(total) if total > 0 else 0.0
+        self._won_episodes = 0
+        self._completed_episodes = 0
+        if total == 0:
+            return {}
+        avg_reward = sum(eval_rewards) / float(len(eval_rewards)) if eval_rewards else 0.0
+        return {
+            "eval_episode_reward": avg_reward,
+            "eval_win_rate": eval_win_rate,
+        }
+
+    def _close_eval_env(self) -> None:
+        if self.eval_env is not None:
+            self.eval_env.close()
+            self.eval_env = None
 
     def _select_topk_neighbors(self, positions: torch.Tensor, alive_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # positions: [envs, agents, 2]

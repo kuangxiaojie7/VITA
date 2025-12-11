@@ -71,16 +71,20 @@ torchrun --nproc_per_node=2 --master_port=29502 \
 python tools/plot_training.py \
     --log-files runs/mappo_dist/mappo/train.log runs/vita_dist/vita/train.log \
     --labels MAPPO VITA \
-    --metrics episode_reward,policy_loss,value_loss,kl,trust_loss \
+    --metrics episode_reward,policy_loss,value_loss,kl,trust_loss,eval_win_rate \
     --smooth 20 \
-    --output-dir figures/compare
+    --output-dir figures/compare \
+    --winrate-style --timesteps-per-update 960
 ```
-将分别生成 `figures/compare/episode_reward.png` 等文件，每张图展示相同指标下两条曲线；若省略 `--output-dir`，则在屏幕上逐个弹出。
+将分别生成 `figures/compare/episode_reward.png` 等文件；开启 `--winrate-style` 后 `eval_win_rate` 会以 “T (mil) vs Test Win Rate%” 的格式呈现，其中 `960` 对应 `episode_length × num_envs`，用于把 update 映射到总环境步数。若省略 `--output-dir`，则在屏幕上逐个弹出。
+
+训练默认每 20 个 update 触发一次评估循环，使用当前策略在无探索噪声的环境里跑 32 局并记录 `eval_episode_reward`、`eval_win_rate`。这些字段在日志里和训练指标放在一起，可以直接用上面的脚本绘制更贴近 PyMARL 基准的胜率曲线。
 
 ## 配置说明
 
 - `configs/smac/mappo_3s5z.yaml`：SMAC 3s5z 标准场景，`history_length=1`，128 维循环策略。
-- `configs/smac/vita_3s5z_noise.yaml`：同一地图但附加高斯噪声（0.1）、丢包率（0.1）和恶意队友（5%）。`history_length=4` 用于构造观测序列，`comm_sight_range=5` + `max_neighbors=4` 将通信限制在视距内，`trust_threshold=0.3`、`trust_lambda=0.15`、`trust_gamma=1.0` 组成默认的信任门控；`enable_trust=true`、`enable_kl=false` 配合 `trust_delay_updates=200`、`comm_delay_updates=120` 及分段 warmup，让信任/通信在策略初步稳定后逐步放开。
+- `configs/smac/vita_3s5z_noise.yaml`：同一地图但附加高斯噪声（0.1）、丢包率（0.1）和恶意队友（5%）。`history_length=4` 用于构造观测序列，`comm_sight_range=5` + `max_neighbors=4` 将通信限制在视距内，`trust_threshold=0.3`、`trust_lambda=0.12`、`trust_gamma=1.0` 组成默认的信任门控；`enable_trust=true`、`enable_kl=false` 配合 `trust_delay_updates=200`、`comm_delay_updates=120` 及分段 warmup，让信任/通信在策略初步稳定后逐步放开。
+- 训练配置新增 `eval_interval_updates`、`eval_episodes` 控制评估循环（默认每 20 次 update 暂停训练、贪心评估 32 局并记录 `eval_win_rate` / `eval_episode_reward`）。
 
 可直接修改 YAML 中的噪声、`max_neighbors`、`history_length` 等字段，快速生成新的干扰组合。
 

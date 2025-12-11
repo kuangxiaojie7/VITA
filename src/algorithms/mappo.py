@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, Any
 
 import numpy as np
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from src.models import PolicyConfig, RecurrentMAPPOPolicy
 from src.utils import Logger, MAPPOBuffer
+from src.envs import make_smac_env
 
 
 @dataclass
@@ -24,6 +25,8 @@ class TrainParams:
     entropy_coef: float = 0.01
     value_loss_coef: float = 0.5
     max_grad_norm: float = 10.0
+    eval_interval_updates: int = 0
+    eval_episodes: int = 0
 
 
 class MAPPOTrainer:
@@ -71,6 +74,11 @@ class MAPPOTrainer:
         )
         self._completed_episodes = 0
         self._won_episodes = 0
+        self.eval_env = None
+        if self.train_cfg.eval_interval_updates > 0 and self.train_cfg.eval_episodes > 0:
+            eval_cfg = asdict(self.env.cfg)
+            eval_cfg["num_envs"] = 1
+            self.eval_env = make_smac_env(eval_cfg)
 
     def train(self) -> None:
         obs_np, state_np, avail_np = self.env.reset()
@@ -81,99 +89,103 @@ class MAPPOTrainer:
         critic_states = torch.zeros_like(actor_states)
         masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
 
-        for update in range(1, self.train_cfg.updates + 1):
-            self.buffer.reset(obs, state, actor_states, critic_states)
-            episode_rewards = 0.0
-            for step in range(self.train_cfg.episode_length):
-                obs = obs.float()
-                state = state.float()
-                avail_actions = avail_actions.float()
-                neighbor_obs_tensor = self._build_neighbor_tensor(obs).float()
-                flat_obs = obs.view(self.num_envs * self.num_agents, self.obs_dim).float()
+        try:
+            for update in range(1, self.train_cfg.updates + 1):
+                self.buffer.reset(obs, state, actor_states, critic_states)
+                episode_rewards = 0.0
+                for step in range(self.train_cfg.episode_length):
+                    obs = obs.float()
+                    state = state.float()
+                    avail_actions = avail_actions.float()
+                    neighbor_obs_tensor = self._build_neighbor_tensor(obs).float()
+                    flat_obs = obs.view(self.num_envs * self.num_agents, self.obs_dim).float()
+                    flat_state = (
+                        state.unsqueeze(1)
+                        .repeat(1, self.num_agents, 1)
+                        .view(self.num_envs * self.num_agents, self.state_dim)
+                    ).float()
+                    flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
+                    flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
+                    flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
+                    flat_avail = avail_actions.view(self.num_envs * self.num_agents, self.action_dim).float()
+
+                    raw_actions, log_probs, values, entropy, next_actor, next_critic = self.policy.act(
+                        flat_obs, flat_state, flat_actor, flat_critic, flat_masks, flat_avail
+                    )
+                    actions = self._ensure_valid_actions(raw_actions, avail_actions)
+
+                    env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
+                    next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
+                    next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
+                    next_state = torch.from_numpy(next_state_np).float().to(self.device)
+                    rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
+                    next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
+
+                    episode_rewards += rewards.mean().item()
+
+                    next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
+                    next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
+                    reshaped_actions = actions.view(self.num_envs, self.num_agents, 1).detach()
+                    reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1).detach()
+                    reshaped_values = values.view(self.num_envs, self.num_agents, 1).detach()
+                    action_one_hot = torch.zeros(
+                        self.num_envs, self.num_agents, self.action_dim, device=self.device, dtype=torch.float32
+                    )
+                    action_one_hot.scatter_(2, reshaped_actions, 1.0)
+                    neighbor_action_tensor = self._build_neighbor_tensor(action_one_hot)
+
+                    self.buffer.insert(
+                        next_obs,
+                        next_state,
+                        next_actor_states,
+                        next_critic_states,
+                        reshaped_actions,
+                        reshaped_log_probs,
+                        reshaped_values,
+                        rewards,
+                        dones,
+                        neighbor_obs_tensor,
+                        neighbor_action_tensor,
+                        obs.unsqueeze(2),
+                        neighbor_obs_tensor.unsqueeze(-2),
+                        avail_actions,
+                    )
+
+                    obs = next_obs
+                    state = next_state
+                    actor_states = next_actor_states
+                    critic_states = next_critic_states
+                    masks = 1.0 - dones
+                    avail_actions = next_avail
+
                 flat_state = (
                     state.unsqueeze(1)
                     .repeat(1, self.num_agents, 1)
                     .view(self.num_envs * self.num_agents, self.state_dim)
-                )
-                flat_state = flat_state.float()
-                flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
+                ).float()
                 flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
                 flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
-                flat_avail = avail_actions.view(self.num_envs * self.num_agents, self.action_dim).float()
+                with torch.no_grad():
+                    next_values, _ = self.policy.get_values(flat_state, flat_critic, flat_masks)
+                next_values = next_values.view(self.num_envs, self.num_agents, 1)
+                self.buffer.compute_returns(next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
+                loss_dict = self.update_policy()
 
-                raw_actions, log_probs, values, entropy, next_actor, next_critic = self.policy.act(
-                    flat_obs, flat_state, flat_actor, flat_critic, flat_masks, flat_avail
-                )
-                actions = self._ensure_valid_actions(raw_actions, avail_actions)
+                eval_metrics = {}
+                if self._should_run_eval(update):
+                    eval_metrics = self._run_evaluation()
 
-                env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
-                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
-                next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
-                next_state = torch.from_numpy(next_state_np).float().to(self.device)
-                rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
-                dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
-                next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
-                self._update_win_rate(done_np, info_list)
-
-                episode_rewards += rewards.mean().item()
-
-                next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
-                next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
-                reshaped_actions = actions.view(self.num_envs, self.num_agents, 1).detach()
-                reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1).detach()
-                reshaped_values = values.view(self.num_envs, self.num_agents, 1).detach()
-                action_one_hot = torch.zeros(
-                    self.num_envs, self.num_agents, self.action_dim, device=self.device, dtype=torch.float32
-                )
-                action_one_hot.scatter_(2, reshaped_actions, 1.0)
-                neighbor_action_tensor = self._build_neighbor_tensor(action_one_hot)
-
-                self.buffer.insert(
-                    next_obs,
-                    next_state,
-                    next_actor_states,
-                    next_critic_states,
-                    reshaped_actions,
-                    reshaped_log_probs,
-                    reshaped_values,
-                    rewards,
-                    dones,
-                    neighbor_obs_tensor,
-                    neighbor_action_tensor,
-                    obs.unsqueeze(2),
-                    neighbor_obs_tensor.unsqueeze(-2),
-                    avail_actions,
-                )
-
-                obs = next_obs
-                state = next_state
-                actor_states = next_actor_states
-                critic_states = next_critic_states
-                masks = 1.0 - dones
-                avail_actions = next_avail
-
-            flat_state = (
-                state.unsqueeze(1)
-                .repeat(1, self.num_agents, 1)
-                .view(self.num_envs * self.num_agents, self.state_dim)
-            )
-            flat_state = flat_state.float()
-            flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
-            flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
-            with torch.no_grad():
-                next_values, next_critic = self.policy.get_values(flat_state, flat_critic, flat_masks)
-            next_values = next_values.view(self.num_envs, self.num_agents, 1)
-            self.buffer.compute_returns(next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
-            loss_dict = self.update_policy()
-
-            log_data = {
-                "update": update,
-                "episode_reward": episode_rewards / self.train_cfg.episode_length,
-                "win_rate": self._current_win_rate,
-            }
-            log_data.update(loss_dict)
-            self.logger.log(log_data, step=update)
-            print(f"[MAPPO] update {update} completed")
+                log_data = {
+                    "update": update,
+                    "episode_reward": episode_rewards / self.train_cfg.episode_length,
+                }
+                log_data.update(loss_dict)
+                log_data.update(eval_metrics)
+                self.logger.log(log_data, step=update)
+                print(f"[MAPPO] update {update} completed")
+        finally:
+            self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
         advantages = self.buffer.advantages[:-1]
@@ -255,35 +267,107 @@ class MAPPOTrainer:
         return torch.cat(neighbors, dim=1)
 
     def _ensure_valid_actions(self, actions: torch.Tensor, avail_actions: torch.Tensor) -> torch.Tensor:
-        reshaped = actions.view(self.num_envs, self.num_agents, -1).clone()
-        avail = avail_actions.view(self.num_envs, self.num_agents, self.action_dim)
-        for env_idx in range(self.num_envs):
+        # actions: [envs * agents, 1]，avail_actions: [envs, agents, action_dim]
+        envs = avail_actions.shape[0]
+        reshaped = actions.view(envs, self.num_agents, -1).clone()
+        avail = avail_actions.view(envs, self.num_agents, self.action_dim)
+        for env_idx in range(envs):
             for agent_idx in range(self.num_agents):
                 act = reshaped[env_idx, agent_idx, 0].long()
                 if avail[env_idx, agent_idx, act] < 0.5:
                     valid = torch.nonzero(avail[env_idx, agent_idx] > 0.5, as_tuple=False)
-                    if valid.numel() == 0:
-                        act = torch.tensor(0, device=actions.device)
-                    else:
-                        act = valid[0, 0]
-                    reshaped[env_idx, agent_idx, 0] = act
+                    reshaped[env_idx, agent_idx, 0] = valid[0, 0] if valid.numel() > 0 else 0
         return reshaped.view(-1, 1)
 
-    @property
-    def _current_win_rate(self) -> float:
-        if self._completed_episodes == 0:
-            return 0.0
-        return self._won_episodes / float(self._completed_episodes)
 
-    def _update_win_rate(self, done_np: np.ndarray, info_list: list[dict[str, Any]]) -> None:
-        done_mask = done_np[:, 0] > 0.5
-        for env_idx, done_flag in enumerate(done_mask):
-            if not done_flag:
-                continue
-            self._completed_episodes += 1
-            info = info_list[env_idx] if env_idx < len(info_list) else {}
-            win = info.get("battle_won", 0)
-            if isinstance(win, (list, tuple)):
-                win = win[-1]
-            if float(win) > 0.5:
-                self._won_episodes += 1
+    def _should_run_eval(self, update: int) -> bool:
+        return (
+            self.eval_env is not None
+            and self.train_cfg.eval_interval_updates > 0
+            and self.train_cfg.eval_episodes > 0
+            and update % self.train_cfg.eval_interval_updates == 0
+        )
+
+    def _run_evaluation(self) -> Dict[str, float]:
+        if self.eval_env is None:
+            return {}
+        env = self.eval_env
+        wins = 0
+        total = 0
+        rewards: list[float] = []
+        self._won_episodes = 0
+        self._completed_episodes = 0
+        mode = self.policy.training
+        self.policy.eval()
+        try:
+            for _ in range(self.train_cfg.eval_episodes):
+                obs_np, state_np, avail_np = env.reset()
+                obs = torch.from_numpy(obs_np).float().to(self.device)
+                state = torch.from_numpy(state_np).float().to(self.device)
+                avail = torch.from_numpy(avail_np).float().to(self.device)
+                actor_states = torch.zeros(env.cfg.num_envs, self.num_agents, self.policy.rnn_hidden_dim, device=self.device)
+                critic_states = torch.zeros_like(actor_states)
+                masks = torch.ones(env.cfg.num_envs, self.num_agents, 1, device=self.device)
+                episode_return = 0.0
+                done = False
+                while not done:
+                    flat_obs = obs.view(env.cfg.num_envs * self.num_agents, self.obs_dim).float()
+                    flat_state = (
+                        state.unsqueeze(1)
+                        .repeat(1, self.num_agents, 1)
+                        .view(env.cfg.num_envs * self.num_agents, self.state_dim)
+                    ).float()
+                    flat_actor = actor_states.view(env.cfg.num_envs * self.num_agents, -1).float()
+                    flat_critic = critic_states.view(env.cfg.num_envs * self.num_agents, -1).float()
+                    flat_masks = masks.view(env.cfg.num_envs * self.num_agents, 1).float()
+                    flat_avail = avail.view(env.cfg.num_envs * self.num_agents, self.action_dim).float()
+                    with torch.no_grad():
+                        raw_actions, _, _, _, next_actor, next_critic = self.policy.act(
+                            flat_obs,
+                            flat_state,
+                            flat_actor,
+                            flat_critic,
+                            flat_masks,
+                            flat_avail,
+                            deterministic=True,
+                        )
+                    actions = self._ensure_valid_actions(raw_actions, avail)
+                    env_actions = actions.view(env.cfg.num_envs, self.num_agents).cpu().numpy()
+                    next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = env.step(env_actions)
+                    obs = torch.from_numpy(next_obs_np).float().to(self.device)
+                    state = torch.from_numpy(next_state_np).float().to(self.device)
+                    avail = torch.from_numpy(next_avail_np).float().to(self.device)
+                    rewards_tensor = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    actor_states = next_actor.view(env.cfg.num_envs, self.num_agents, -1).detach()
+                    critic_states = next_critic.view(env.cfg.num_envs, self.num_agents, -1).detach()
+                    masks = 1.0 - torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
+                    episode_return += rewards_tensor.mean().item()
+                    done = bool(done_np[0, 0] > 0.5)
+                    if done:
+                        info = info_list[0] if info_list else {}
+                        win = info.get("battle_won", 0)
+                        if isinstance(win, (list, tuple)):
+                            win = win[-1]
+                        if float(win) > 0.5:
+                            wins += 1
+                            self._won_episodes += 1
+                        self._completed_episodes += 1
+                        total += 1
+                        rewards.append(episode_return / self.train_cfg.episode_length)
+        finally:
+            self.policy.train(mode)
+        eval_win_rate = wins / float(total) if total > 0 else 0.0
+        self._won_episodes = 0
+        self._completed_episodes = 0
+        if total == 0:
+            return {}
+        avg_reward = sum(rewards) / float(len(rewards)) if rewards else 0.0
+        return {
+            "eval_episode_reward": avg_reward,
+            "eval_win_rate": eval_win_rate,
+        }
+
+    def _close_eval_env(self) -> None:
+        if self.eval_env is not None:
+            self.eval_env.close()
+            self.eval_env = None

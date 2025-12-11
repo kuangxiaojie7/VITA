@@ -40,10 +40,13 @@ class VITAAgent(torch.nn.Module):
         self.residual = GatedResidualBlock(cfg.hidden_dim)
         self.neighbor_norm = torch.nn.LayerNorm(cfg.hidden_dim)
         self.comm_dropout = torch.nn.Dropout(cfg.comm_dropout)
+        critic_hidden = max(cfg.hidden_dim, 256)
         self.critic_mlp = torch.nn.Sequential(
-            torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            torch.nn.Linear(cfg.hidden_dim, critic_hidden),
             torch.nn.ReLU(),
-            torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            torch.nn.Linear(critic_hidden, critic_hidden),
+            torch.nn.ReLU(),
+            torch.nn.Linear(critic_hidden, cfg.hidden_dim),
         )
         self.policy_head = torch.nn.Linear(cfg.hidden_dim, cfg.action_dim)
         self.value_head = torch.nn.Linear(cfg.hidden_dim, 1)

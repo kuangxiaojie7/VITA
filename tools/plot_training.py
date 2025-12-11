@@ -25,7 +25,7 @@ def load_log(path: Path) -> List[Dict[str, float]]:
 
 
 def moving_average(values: List[float], window: int) -> List[float]:
-    if window <= 1:
+    if window <= 1 or len(values) <= window:
         return values
     smoothed: List[float] = []
     acc = 0.0
@@ -33,13 +33,23 @@ def moving_average(values: List[float], window: int) -> List[float]:
         acc += val
         if idx >= window:
             acc -= values[idx - window]
+        if idx >= window - 1:
             smoothed.append(acc / window)
-        elif idx == window - 1:
-            smoothed.append(acc / window)
-    if len(smoothed) < len(values):
-        padding = [smoothed[-1]] * (len(values) - len(smoothed))
-        smoothed.extend(padding)
-    return smoothed
+    # Pad the beginning with the first computed average to keep lengths matched
+    if smoothed:
+        padding = [smoothed[0]] * (len(values) - len(smoothed))
+        return padding + smoothed
+    return values
+
+
+def _format_axes(metric: str, args) -> None:
+    if args.winrate_style and "win_rate" in metric:
+        plt.xlabel("T (mil)")
+        plt.ylabel("Test Win Rate%")
+        plt.ylim(0, 100)
+    else:
+        plt.xlabel("Training Update")
+        plt.ylabel(metric)
 
 
 def plot_metric(
@@ -47,21 +57,38 @@ def plot_metric(
     runs: Sequence[Dict[str, object]],
     smooth: int,
     output_dir: Path | None,
+    args,
 ) -> None:
     plt.figure(figsize=(10, 5))
+    if args.winrate_style:
+        plt.gca().set_facecolor("#f9f9f9")
+        plt.grid(True, alpha=0.4, color="#cccccc")
     for run in runs:
         entries: List[Dict[str, float]] = run["entries"]  # type: ignore
-        steps = [entry.get("step", idx + 1) for idx, entry in enumerate(entries)]
-        values = [entry.get(metric) for entry in entries]
-        if any(v is None for v in values):
-            print(f"[WARN] '{metric}' missing in some entries for run {run['label']}, skipping.")
+        filtered_steps: List[float] = []
+        filtered_values: List[float] = []
+        for idx, entry in enumerate(entries):
+            val = entry.get(metric)
+            if val is None:
+                continue
+            step_val = entry.get("step", idx + 1)
+            if args.winrate_style and "win_rate" in metric:
+                step_val = step_val * args.timesteps_per_update / 1e6
+                val = val * 100.0
+            filtered_steps.append(step_val)
+            filtered_values.append(val)
+        if not filtered_values:
+            print(f"[WARN] '{metric}' not present for run {run['label']}, skipping.")
             continue
-        smoothed = moving_average(values, smooth)
-        plt.plot(steps, smoothed, label=f"{run['label']} (window={smooth})")
+        smoothed = moving_average(filtered_values, smooth)
+        x_vals = filtered_steps[: len(smoothed)]
+        plt.plot(x_vals, smoothed, linewidth=2, label=f"{run['label']} (window={smooth})")
+        if args.winrate_style:
+            plt.fill_between(x_vals, smoothed, alpha=0.15)
     plt.title(metric)
-    plt.xlabel("Training Update")
-    plt.ylabel(metric)
-    plt.grid(True, alpha=0.3)
+    _format_axes(metric, args)
+    if not args.winrate_style:
+        plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
     if output_dir:
@@ -92,7 +119,7 @@ def main() -> None:
     parser.add_argument(
         "--metrics",
         type=str,
-        default="episode_reward,policy_loss,value_loss",
+        default="episode_reward,policy_loss,value_loss,eval_win_rate",
         help="Comma-separated metric names to visualize.",
     )
     parser.add_argument("--smooth", type=int, default=10, help="Moving-average window size.")
@@ -101,6 +128,17 @@ def main() -> None:
         type=Path,
         default=None,
         help="If provided, saves each metric figure to this directory.",
+    )
+    parser.add_argument(
+        "--winrate-style",
+        action="store_true",
+        help="Format plots similar to SMAC win-rate figures (T mil on x-axis, percentage on y-axis).",
+    )
+    parser.add_argument(
+        "--timesteps-per-update",
+        type=float,
+        default=1.0,
+        help="Environment timesteps represented by one training update (used when --winrate-style).",
     )
     args = parser.parse_args()
 
@@ -115,7 +153,7 @@ def main() -> None:
         runs.append({"label": label, "entries": entries})
 
     for metric in metrics:
-        plot_metric(metric, runs, max(1, args.smooth), args.output_dir)
+        plot_metric(metric, runs, max(1, args.smooth), args.output_dir, args)
 
 
 if __name__ == "__main__":
