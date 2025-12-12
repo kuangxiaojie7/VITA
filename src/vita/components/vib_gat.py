@@ -31,6 +31,7 @@ class VIBGATLayer(nn.Module):
         neighbor_feat: torch.Tensor,
         trust_mask: torch.Tensor,
         comm_mask: torch.Tensor,
+        alive_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
     
         norm_neighbors = self.pre_norm(neighbor_feat)
@@ -49,6 +50,9 @@ class VIBGATLayer(nn.Module):
         bias_input = torch.abs(self_feat.unsqueeze(1) - neighbor_feat)
         bias = self.bias_mlp(bias_input).squeeze(-1)
         attn_logits = attn_logits - self.bias_coef * bias
+        if alive_mask is not None:
+            comm_mask = comm_mask * alive_mask
+            trust_mask = trust_mask * alive_mask + 1e-6
         trust_term = torch.log(trust_mask.squeeze(-1) + 1e-6)
         attn_logits = attn_logits + trust_term
         neighbor_mask = comm_mask.squeeze(-1)

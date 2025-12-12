@@ -6,6 +6,7 @@ env:
   map_name: 3s5z
   difficulty: "7"
   num_envs: 8
+  reward_scale: 20.0
   obs_noise_std: 0.0
   packet_drop_prob: 0.0
   malicious_agent_prob: 0.0

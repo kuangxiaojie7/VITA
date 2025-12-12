@@ -120,7 +120,7 @@ class VITAAgent(torch.nn.Module):
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
-            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask)
+            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask, alive_mask=comm_mask)
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
@@ -184,7 +184,7 @@ class VITAAgent(torch.nn.Module):
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
-            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask)
+            comm_feat, kl_loss = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask, alive_mask=comm_mask)
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
