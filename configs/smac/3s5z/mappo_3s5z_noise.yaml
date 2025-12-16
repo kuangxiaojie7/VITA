@@ -1,0 +1,31 @@
+algorithm: mappo
+seed: 1337
+cuda: true
+env:
+  name: smac
+  map_name: 3s5z
+  difficulty: "7"
+  num_envs: 8
+  reward_scale: 1.0
+  obs_noise_std: 0.1
+  packet_drop_prob: 0.1
+  malicious_agent_prob: 0.05
+model:
+  hidden_dim: 128
+  activation: relu
+  max_neighbors: 4
+  history_length: 1
+train:
+  episode_length: 120
+  updates: 1000
+  lr: 0.0005
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_param: 0.2
+  ppo_epochs: 5
+  num_mini_batch: 4
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 10.0
+  eval_interval_updates: 20
+  eval_episodes: 32
