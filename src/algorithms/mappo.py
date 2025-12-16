@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from src.models import PolicyConfig, RecurrentMAPPOPolicy
-from src.utils import Logger, MAPPOBuffer
+from src.utils import Logger, MAPPOBuffer, RunningMeanStd
 from src.envs import make_smac_env
 
 
@@ -50,6 +50,8 @@ class MAPPOTrainer:
         self.max_neighbors = max(1, self.max_neighbors)
         self.history_length = policy_cfg.get("history_length", 1)
         self.train_cfg = TrainParams(**train_cfg)
+        self.reward_norm = RunningMeanStd()
+        self.value_norm = RunningMeanStd()
 
         policy_config = PolicyConfig(
             obs_dim=self.obs_dim,
@@ -118,11 +120,13 @@ class MAPPOTrainer:
                     next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
                     next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
                     next_state = torch.from_numpy(next_state_np).float().to(self.device)
-                    rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    raw_rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    self.reward_norm.update(reward_np)
+                    rewards = self.reward_norm.normalize(raw_rewards, use_mean=False)
                     dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                     next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
 
-                    episode_rewards += rewards.mean().item()
+                    episode_rewards += raw_rewards.mean().item()
 
                     next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
                     next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
@@ -169,7 +173,9 @@ class MAPPOTrainer:
                 with torch.no_grad():
                     next_values, _ = self.policy.get_values(flat_state, flat_critic, flat_masks)
                 next_values = next_values.view(self.num_envs, self.num_agents, 1)
-                self.buffer.compute_returns(next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
+                denorm_next_values = self.value_norm.denormalize(next_values, use_mean=True)
+                self.buffer.values.copy_(self.value_norm.denormalize(self.buffer.values, use_mean=True))
+                self.buffer.compute_returns(denorm_next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
                 loss_dict = self.update_policy()
 
                 eval_metrics = {}
@@ -188,6 +194,7 @@ class MAPPOTrainer:
             self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
+        self.value_norm.update(self.buffer.returns[:-1].detach().cpu().numpy())
         advantages = self.buffer.advantages[:-1]
         adv_mean = advantages.mean()
         adv_std = advantages.std() + 1e-5
@@ -222,7 +229,8 @@ class MAPPOTrainer:
                 surr1 = ratio * advantages_batch
                 surr2 = torch.clamp(ratio, 1.0 - self.train_cfg.clip_param, 1.0 + self.train_cfg.clip_param) * advantages_batch
                 policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(returns_batch, values)
+                norm_returns = self.value_norm.normalize(returns_batch, use_mean=True)
+                value_loss = F.huber_loss(values, norm_returns, delta=10.0)
                 entropy_loss = entropy.mean()
 
                 loss = (

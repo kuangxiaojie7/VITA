@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from src.vita import VITAAgent, VITAAgentConfig
-from src.utils import Logger, MAPPOBuffer
+from src.utils import Logger, MAPPOBuffer, RunningMeanStd
 from src.envs import make_smac_env
 
 
@@ -92,6 +92,8 @@ class VITATrainer:
         self.current_positions = torch.zeros(self.num_envs, self.num_agents, 2, device=device)
         self.current_alive_mask = torch.ones(self.num_envs, self.num_agents, device=device)
         self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.train_cfg.lr, eps=1e-8)
+        self.reward_norm = RunningMeanStd()
+        self.value_norm = RunningMeanStd()
         self.buffer = MAPPOBuffer(
             self.train_cfg.episode_length,
             self.num_envs,
@@ -115,153 +117,158 @@ class VITATrainer:
             self.eval_env = make_smac_env(eval_cfg)
 
 
-def train(self) -> None:
-    obs_np, state_np, avail_np = self.env.reset()
-    obs = torch.from_numpy(obs_np).to(self.device).float()
-    state = torch.from_numpy(state_np).to(self.device).float()
-    avail_actions = torch.from_numpy(avail_np).to(self.device).float()
-    actor_states = torch.zeros(self.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
-    critic_states = torch.zeros_like(actor_states)
-    masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
-    self._initialize_history(obs)
-    self._refresh_env_metadata()
+    def train(self) -> None:
+        obs_np, state_np, avail_np = self.env.reset()
+        obs = torch.from_numpy(obs_np).to(self.device).float()
+        state = torch.from_numpy(state_np).to(self.device).float()
+        avail_actions = torch.from_numpy(avail_np).to(self.device).float()
+        actor_states = torch.zeros(self.num_envs, self.num_agents, self.agent.rnn_hidden_dim, device=self.device)
+        critic_states = torch.zeros_like(actor_states)
+        masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
+        self._initialize_history(obs)
+        self._refresh_env_metadata()
 
-    try:
-        for update in range(1, self.train_cfg.updates + 1):
-            self._current_update = update
-            comm_elapsed = self._current_update - self.train_cfg.comm_delay_updates
-            comm_coeff = self._comm_schedule_coeff(
-                comm_elapsed, self.train_cfg.comm_warmup_updates, self.train_cfg.comm_full_warmup_updates
-            )
-            self.agent.set_comm_strength(comm_coeff)
-            self.agent.set_comm_enabled(comm_coeff > 0.0)
-            trust_elapsed = self._current_update - self.train_cfg.trust_delay_updates
-            trust_gate = self._schedule_coeff(trust_elapsed, self.train_cfg.trust_warmup_updates)
-            self.agent.set_trust_active(trust_gate > 0.0)
-            self.buffer.reset(obs, state, actor_states, critic_states)
-            reward_sum = 0.0
-            for step in range(self.train_cfg.episode_length):
-                obs_seq = self._stack_history().contiguous().float()
-                obs = obs.float()
-                state = state.float()
-                avail_actions = avail_actions.float()
-                neighbor_indices, neighbor_mask = self._select_topk_neighbors(self.current_positions, self.current_alive_mask)
-                neighbor_seq = self._gather_neighbor_sequences(obs_seq, neighbor_indices).contiguous()
-                neighbor_mask = neighbor_mask.to(obs_seq.device).detach()
-                flat_obs_seq = obs_seq.view(self.num_envs * self.num_agents, self.history_length, self.obs_dim).float()
+        try:
+            for update in range(1, self.train_cfg.updates + 1):
+                self._current_update = update
+                comm_elapsed = self._current_update - self.train_cfg.comm_delay_updates
+                comm_coeff = self._comm_schedule_coeff(
+                    comm_elapsed, self.train_cfg.comm_warmup_updates, self.train_cfg.comm_full_warmup_updates
+                )
+                self.agent.set_comm_strength(comm_coeff)
+                self.agent.set_comm_enabled(comm_coeff > 0.0)
+                trust_elapsed = self._current_update - self.train_cfg.trust_delay_updates
+                trust_gate = self._schedule_coeff(trust_elapsed, self.train_cfg.trust_warmup_updates)
+                self.agent.set_trust_active(trust_gate > 0.0)
+                self.buffer.reset(obs, state, actor_states, critic_states)
+                reward_sum = 0.0
+                for step in range(self.train_cfg.episode_length):
+                    obs_seq = self._stack_history().contiguous().float()
+                    obs = obs.float()
+                    state = state.float()
+                    avail_actions = avail_actions.float()
+                    neighbor_indices, neighbor_mask = self._select_topk_neighbors(self.current_positions, self.current_alive_mask)
+                    neighbor_seq = self._gather_neighbor_sequences(obs_seq, neighbor_indices).contiguous()
+                    neighbor_mask = neighbor_mask.to(obs_seq.device).detach()
+                    flat_obs_seq = obs_seq.view(self.num_envs * self.num_agents, self.history_length, self.obs_dim).float()
+                    flat_state = (
+                        state.unsqueeze(1)
+                        .repeat(1, self.num_agents, 1)
+                        .view(self.num_envs * self.num_agents, self.state_dim)
+                    )
+                    flat_state = flat_state.float()
+                    flat_neighbor_seq = neighbor_seq.view(
+                        self.num_envs * self.num_agents, self.max_neighbors, self.history_length, self.obs_dim
+                    ).float()
+                    flat_neighbor_mask = neighbor_mask.view(
+                        self.num_envs * self.num_agents, self.max_neighbors, 1
+                    ).float()
+                    flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
+                    flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
+                    flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
+                    flat_avail = avail_actions.view(self.num_envs * self.num_agents, self.action_dim).float()
+
+                    outputs = self.agent.act(
+                        flat_obs_seq,
+                        flat_state,
+                        flat_neighbor_seq,
+                        flat_neighbor_mask,
+                        None,
+                        flat_actor,
+                        flat_critic,
+                        flat_masks,
+                        flat_avail,
+                    )
+                    actions = self._ensure_valid_actions(outputs["actions"], avail_actions)
+                    log_probs = outputs["log_probs"]
+                    values = outputs["values"]
+                    next_actor = outputs["next_actor_state"]
+                    next_critic = outputs["next_critic_state"]
+
+                    env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
+                    next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
+                    next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
+                    next_state = torch.from_numpy(next_state_np).float().to(self.device)
+                    next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
+                    self._refresh_env_metadata()
+                    raw_rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
+                    self.reward_norm.update(reward_np)
+                    rewards = self.reward_norm.normalize(raw_rewards, use_mean=False)
+                    dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
+                    reward_sum += raw_rewards.mean().item()
+
+                    next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
+                    next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
+                    reshaped_actions = actions.view(self.num_envs, self.num_agents, 1).detach()
+                    reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1).detach()
+                    reshaped_values = values.view(self.num_envs, self.num_agents, 1).detach()
+                    action_one_hot = torch.zeros(
+                        self.num_envs, self.num_agents, self.action_dim, device=self.device, dtype=torch.float32
+                    )
+                    action_one_hot.scatter_(2, reshaped_actions, 1.0)
+                    neighbor_action_tensor = self._gather_neighbor_actions(action_one_hot, neighbor_indices)
+
+                    latest_neighbor_obs = neighbor_seq[:, :, :, -1, :].contiguous()
+
+                    self.buffer.insert(
+                        next_obs,
+                        next_state,
+                        next_actor_states,
+                        next_critic_states,
+                        reshaped_actions,
+                        reshaped_log_probs,
+                        reshaped_values,
+                        rewards,
+                        dones,
+                        latest_neighbor_obs,
+                        neighbor_action_tensor,
+                        obs_seq,
+                        neighbor_seq,
+                        avail_actions,
+                        neighbor_mask,
+                    )
+
+                    obs = next_obs
+                    state = next_state
+                    actor_states = next_actor_states
+                    critic_states = next_critic_states
+                    masks = 1.0 - dones
+                    self._update_history(next_obs)
+                    avail_actions = next_avail
+
                 flat_state = (
                     state.unsqueeze(1)
                     .repeat(1, self.num_agents, 1)
                     .view(self.num_envs * self.num_agents, self.state_dim)
                 )
                 flat_state = flat_state.float()
-                flat_neighbor_seq = neighbor_seq.view(
-                    self.num_envs * self.num_agents, self.max_neighbors, self.history_length, self.obs_dim
-                ).float()
-                flat_neighbor_mask = neighbor_mask.view(
-                    self.num_envs * self.num_agents, self.max_neighbors, 1
-                ).float()
-                flat_actor = actor_states.view(self.num_envs * self.num_agents, -1).float()
                 flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
                 flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
-                flat_avail = avail_actions.view(self.num_envs * self.num_agents, self.action_dim).float()
+                with torch.no_grad():
+                    next_values, _ = self.agent.get_values(flat_state, flat_critic, flat_masks)
+                next_values = next_values.view(self.num_envs, self.num_agents, 1)
+                denorm_next_values = self.value_norm.denormalize(next_values, use_mean=True)
+                self.buffer.values.copy_(self.value_norm.denormalize(self.buffer.values, use_mean=True))
+                self.buffer.compute_returns(denorm_next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
+                loss_dict = self.update_policy()
 
-                outputs = self.agent.act(
-                    flat_obs_seq,
-                    flat_state,
-                    flat_neighbor_seq,
-                    flat_neighbor_mask,
-                    None,
-                    flat_actor,
-                    flat_critic,
-                    flat_masks,
-                    flat_avail,
-                )
-                actions = self._ensure_valid_actions(outputs["actions"], avail_actions)
-                log_probs = outputs["log_probs"]
-                values = outputs["values"]
-                next_actor = outputs["next_actor_state"]
-                next_critic = outputs["next_critic_state"]
+                eval_metrics = {}
+                if self._should_run_eval(update):
+                    eval_metrics = self._run_evaluation()
 
-                env_actions = actions.view(self.num_envs, self.num_agents).cpu().numpy()
-                next_obs_np, next_state_np, reward_np, done_np, next_avail_np, info_list = self.env.step(env_actions)
-                next_obs = torch.from_numpy(next_obs_np).float().to(self.device)
-                next_state = torch.from_numpy(next_state_np).float().to(self.device)
-                next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
-                self._refresh_env_metadata()
-                rewards = torch.from_numpy(reward_np).float().unsqueeze(-1).to(self.device)
-                dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
-                reward_sum += rewards.mean().item()
-
-                next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
-                next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
-                reshaped_actions = actions.view(self.num_envs, self.num_agents, 1).detach()
-                reshaped_log_probs = log_probs.view(self.num_envs, self.num_agents, 1).detach()
-                reshaped_values = values.view(self.num_envs, self.num_agents, 1).detach()
-                action_one_hot = torch.zeros(
-                    self.num_envs, self.num_agents, self.action_dim, device=self.device, dtype=torch.float32
-                )
-                action_one_hot.scatter_(2, reshaped_actions, 1.0)
-                neighbor_action_tensor = self._gather_neighbor_actions(action_one_hot, neighbor_indices)
-
-                latest_neighbor_obs = neighbor_seq[:, :, :, -1, :].contiguous()
-
-                self.buffer.insert(
-                    next_obs,
-                    next_state,
-                    next_actor_states,
-                    next_critic_states,
-                    reshaped_actions,
-                    reshaped_log_probs,
-                    reshaped_values,
-                    rewards,
-                    dones,
-                    latest_neighbor_obs,
-                    neighbor_action_tensor,
-                    obs_seq,
-                    neighbor_seq,
-                    avail_actions,
-                    neighbor_mask,
-                )
-
-                obs = next_obs
-                state = next_state
-                actor_states = next_actor_states
-                critic_states = next_critic_states
-                masks = 1.0 - dones
-                self._update_history(next_obs)
-                avail_actions = next_avail
-
-            flat_state = (
-                state.unsqueeze(1)
-                .repeat(1, self.num_agents, 1)
-                .view(self.num_envs * self.num_agents, self.state_dim)
-            )
-            flat_state = flat_state.float()
-            flat_critic = critic_states.view(self.num_envs * self.num_agents, -1).float()
-            flat_masks = masks.view(self.num_envs * self.num_agents, 1).float()
-            with torch.no_grad():
-                next_values, _ = self.agent.get_values(flat_state, flat_critic, flat_masks)
-            next_values = next_values.view(self.num_envs, self.num_agents, 1)
-            self.buffer.compute_returns(next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
-            loss_dict = self.update_policy()
-
-            eval_metrics = {}
-            if self._should_run_eval(update):
-                eval_metrics = self._run_evaluation()
-
-            log_payload = {
-                "update": update,
-                "episode_reward": reward_sum / self.train_cfg.episode_length,
-                **loss_dict,
-                **eval_metrics,
-            }
-            self.logger.log(log_payload, step=update)
-            print(f"[VITA] update {update} completed")
-    finally:
-        self._close_eval_env()
+                log_payload = {
+                    "update": update,
+                    "episode_reward": reward_sum / self.train_cfg.episode_length,
+                    **loss_dict,
+                    **eval_metrics,
+                }
+                self.logger.log(log_payload, step=update)
+                print(f"[VITA] update {update} completed")
+        finally:
+            self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
+        self.value_norm.update(self.buffer.returns[:-1].detach().cpu().numpy())
         advantages = self.buffer.advantages[:-1]
         adv_mean = advantages.mean()
         adv_std = advantages.std() + 1e-6
@@ -325,7 +332,8 @@ def train(self) -> None:
                     ratio, 1.0 - self.train_cfg.clip_param, 1.0 + self.train_cfg.clip_param
                 ) * advantages_batch
                 policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(returns_batch, values)
+                norm_returns = self.value_norm.normalize(returns_batch, use_mean=True)
+                value_loss = F.huber_loss(values, norm_returns, delta=10.0)
                 entropy_loss = entropy.mean()
 
                 total_loss = (
