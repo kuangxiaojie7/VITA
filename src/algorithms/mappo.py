@@ -6,6 +6,7 @@ from typing import Dict, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
 from src.models import PolicyConfig, RecurrentMAPPOPolicy
 from src.utils import Logger, MAPPOBuffer, RunningMeanStd
@@ -22,6 +23,10 @@ class TrainParams:
     clip_param: float = 0.2
     ppo_epochs: int = 5
     num_mini_batch: int = 4
+    data_chunk_length: int = 10
+    use_recurrent_generator: bool = True
+    use_policy_active_masks: bool = True
+    use_value_active_masks: bool = True
     entropy_coef: float = 0.01
     value_loss_coef: float = 0.5
     max_grad_norm: float = 10.0
@@ -90,10 +95,13 @@ class MAPPOTrainer:
         actor_states = torch.zeros(self.num_envs, self.num_agents, self.policy.rnn_hidden_dim, device=self.device)
         critic_states = torch.zeros_like(actor_states)
         masks = torch.ones(self.num_envs, self.num_agents, 1, device=self.device)
+        active_masks = (
+            torch.from_numpy(self.env.get_agent_alive_mask()).float().to(self.device).unsqueeze(-1)
+        )
 
         try:
             for update in range(1, self.train_cfg.updates + 1):
-                self.buffer.reset(obs, state, actor_states, critic_states)
+                self.buffer.reset(obs, state, actor_states, critic_states, active_masks=active_masks)
                 episode_rewards = 0.0
                 for step in range(self.train_cfg.episode_length):
                     obs = obs.float()
@@ -125,6 +133,9 @@ class MAPPOTrainer:
                     rewards = self.reward_norm.normalize(raw_rewards, use_mean=False)
                     dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                     next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
+                    next_active_masks = (
+                        torch.from_numpy(self.env.get_agent_alive_mask()).float().to(self.device).unsqueeze(-1)
+                    )
 
                     episode_rewards += raw_rewards.mean().item()
 
@@ -149,6 +160,7 @@ class MAPPOTrainer:
                         reshaped_values,
                         rewards,
                         dones,
+                        next_active_masks,
                         neighbor_obs_tensor,
                         neighbor_action_tensor,
                         obs.unsqueeze(2),
@@ -162,6 +174,7 @@ class MAPPOTrainer:
                     critic_states = next_critic_states
                     masks = 1.0 - dones
                     avail_actions = next_avail
+                    active_masks = next_active_masks
 
                 flat_state = (
                     state.unsqueeze(1)
@@ -196,57 +209,135 @@ class MAPPOTrainer:
     def update_policy(self) -> Dict[str, float]:
         self.value_norm.update(self.buffer.returns[:-1].detach().cpu().numpy())
         advantages = self.buffer.advantages[:-1]
-        adv_mean = advantages.mean()
-        adv_std = advantages.std() + 1e-5
+        active_masks = self.buffer.active_masks[:-1]
+        adv_flat = advantages.reshape(-1)
+        active_flat = active_masks.reshape(-1)
+        valid = active_flat > 0.5
+        if valid.any():
+            adv_mean = adv_flat[valid].mean()
+            adv_std = adv_flat[valid].std(unbiased=False) + 1e-5
+        else:
+            adv_mean = adv_flat.mean()
+            adv_std = adv_flat.std(unbiased=False) + 1e-5
         norm_adv = (advantages - adv_mean) / adv_std
 
         value_loss_epoch = 0.0
         policy_loss_epoch = 0.0
         entropy_epoch = 0.0
         num_updates = 0
+        use_recurrent = bool(self.train_cfg.use_recurrent_generator and self.train_cfg.data_chunk_length > 1)
+        use_policy_active = bool(self.train_cfg.use_policy_active_masks)
+        use_value_active = bool(self.train_cfg.use_value_active_masks)
         for _ in range(self.train_cfg.ppo_epochs):
-            for batch in self.buffer.mini_batch_generator(norm_adv, self.train_cfg.num_mini_batch):
-                obs_batch = batch["obs"]
-                state_batch = batch["states"]
-                actions_batch = batch["actions"]
-                old_log_probs_batch = batch["old_log_probs"]
-                returns_batch = batch["returns"]
-                advantages_batch = batch["advantages"]
-                masks_batch = batch["masks"]
-                rnn_actor_batch = batch["rnn_states_actor"]
-                rnn_critic_batch = batch["rnn_states_critic"]
-                avail_batch = batch["avail_actions"]
-                log_probs, entropy, values = self.policy.evaluate_actions(
-                    obs_batch.float(),
-                    state_batch.float(),
-                    actions_batch,
-                    rnn_actor_batch.float(),
-                    rnn_critic_batch.float(),
-                    masks_batch.float(),
-                    avail_batch.float(),
+            if use_recurrent:
+                data_iter = self.buffer.recurrent_generator(
+                    norm_adv, self.train_cfg.num_mini_batch, self.train_cfg.data_chunk_length
                 )
-                ratio = torch.exp(log_probs - old_log_probs_batch)
-                surr1 = ratio * advantages_batch
-                surr2 = torch.clamp(ratio, 1.0 - self.train_cfg.clip_param, 1.0 + self.train_cfg.clip_param) * advantages_batch
-                policy_loss = -torch.min(surr1, surr2).mean()
-                norm_returns = self.value_norm.normalize(returns_batch, use_mean=True)
-                value_loss = F.huber_loss(values, norm_returns, delta=10.0)
-                entropy_loss = entropy.mean()
+            else:
+                data_iter = self.buffer.mini_batch_generator(norm_adv, self.train_cfg.num_mini_batch)
 
-                loss = (
-                    policy_loss
-                    + self.train_cfg.value_loss_coef * value_loss
-                    - self.train_cfg.entropy_coef * entropy_loss
-                )
+            for batch in data_iter:
+                if use_recurrent:
+                    obs_seq = batch["obs"].float()  # [L, N, obs_dim]
+                    state_seq = batch["states"].float()  # [L, N, state_dim]
+                    actions_seq = batch["actions"]  # [L, N, 1]
+                    old_log_probs_seq = batch["old_log_probs"]  # [L, N, 1]
+                    returns_seq = batch["returns"]  # [L, N, 1]
+                    advantages_seq = batch["advantages"]  # [L, N, 1]
+                    masks_seq = batch["masks"].float()  # [L, N, 1]
+                    active_seq = batch["active_masks"].float()  # [L, N, 1]
+                    avail_seq = batch["avail_actions"].float()  # [L, N, action_dim]
+                    rnn_actor = batch["rnn_states_actor"].float()  # [N, hidden]
+                    rnn_critic = batch["rnn_states_critic"].float()
+
+                    log_probs_steps = []
+                    entropy_steps = []
+                    values_steps = []
+                    for t in range(obs_seq.size(0)):
+                        logits, rnn_actor = self.policy._actor_forward(obs_seq[t], rnn_actor, masks_seq[t])
+                        logits = self.policy._mask_logits(logits, avail_seq[t])
+                        dist = Categorical(logits=logits)
+                        log_probs_steps.append(dist.log_prob(actions_seq[t].squeeze(-1)).unsqueeze(-1))
+                        entropy_steps.append(dist.entropy().unsqueeze(-1))
+                        values, rnn_critic = self.policy._critic_forward(state_seq[t], rnn_critic, masks_seq[t])
+                        values_steps.append(values)
+
+                    log_probs = torch.stack(log_probs_steps, dim=0)
+                    entropy = torch.stack(entropy_steps, dim=0)
+                    values = torch.stack(values_steps, dim=0)
+                    ratio = torch.exp(log_probs - old_log_probs_seq)
+                    surr1 = ratio * advantages_seq
+                    surr2 = torch.clamp(
+                        ratio, 1.0 - self.train_cfg.clip_param, 1.0 + self.train_cfg.clip_param
+                    ) * advantages_seq
+                    policy_loss_terms = -torch.min(surr1, surr2)
+                    active_denom = active_seq.sum().clamp_min(1.0)
+                    if use_policy_active:
+                        policy_loss = (policy_loss_terms * active_seq).sum() / active_denom
+                        entropy_loss = (entropy * active_seq).sum() / active_denom
+                    else:
+                        policy_loss = policy_loss_terms.mean()
+                        entropy_loss = entropy.mean()
+
+                    norm_returns = self.value_norm.normalize(returns_seq, use_mean=True)
+                    value_loss_terms = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    if use_value_active:
+                        value_loss = (value_loss_terms * active_seq).sum() / active_denom
+                    else:
+                        value_loss = value_loss_terms.mean()
+                else:
+                    obs_batch = batch["obs"].float()
+                    state_batch = batch["states"].float()
+                    actions_batch = batch["actions"]
+                    old_log_probs_batch = batch["old_log_probs"]
+                    returns_batch = batch["returns"]
+                    advantages_batch = batch["advantages"]
+                    masks_batch = batch["masks"].float()
+                    active_batch = batch["active_masks"].float()
+                    rnn_actor_batch = batch["rnn_states_actor"].float()
+                    rnn_critic_batch = batch["rnn_states_critic"].float()
+                    avail_batch = batch["avail_actions"].float()
+
+                    log_probs, entropy, values = self.policy.evaluate_actions(
+                        obs_batch,
+                        state_batch,
+                        actions_batch,
+                        rnn_actor_batch,
+                        rnn_critic_batch,
+                        masks_batch,
+                        avail_batch,
+                    )
+                    ratio = torch.exp(log_probs - old_log_probs_batch)
+                    surr1 = ratio * advantages_batch
+                    surr2 = torch.clamp(
+                        ratio, 1.0 - self.train_cfg.clip_param, 1.0 + self.train_cfg.clip_param
+                    ) * advantages_batch
+                    policy_loss_terms = -torch.min(surr1, surr2)
+                    active_denom = active_batch.sum().clamp_min(1.0)
+                    if use_policy_active:
+                        policy_loss = (policy_loss_terms * active_batch).sum() / active_denom
+                        entropy_loss = (entropy * active_batch).sum() / active_denom
+                    else:
+                        policy_loss = policy_loss_terms.mean()
+                        entropy_loss = entropy.mean()
+
+                    norm_returns = self.value_norm.normalize(returns_batch, use_mean=True)
+                    value_loss_terms = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    if use_value_active:
+                        value_loss = (value_loss_terms * active_batch).sum() / active_denom
+                    else:
+                        value_loss = value_loss_terms.mean()
+
+                loss = policy_loss + self.train_cfg.value_loss_coef * value_loss - self.train_cfg.entropy_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_cfg.max_grad_norm)
                 self.optimizer.step()
 
-                policy_loss_epoch += policy_loss.item()
-                value_loss_epoch += value_loss.item()
-                entropy_epoch += entropy_loss.item()
+                policy_loss_epoch += float(policy_loss.item())
+                value_loss_epoch += float(value_loss.item())
+                entropy_epoch += float(entropy_loss.item())
                 num_updates += 1
 
         self.buffer.after_update()

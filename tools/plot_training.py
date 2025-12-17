@@ -47,6 +47,7 @@ def _format_axes(metric: str, args) -> None:
         plt.xlabel("T (mil)")
         plt.ylabel("Test Win Rate%")
         plt.ylim(0, 100)
+        plt.xlim(left=0)
     else:
         plt.xlabel("Training Update")
         plt.ylabel(metric)
@@ -77,11 +78,28 @@ def plot_metric(
                 val = val * 100.0
             filtered_steps.append(step_val)
             filtered_values.append(val)
+        if args.winrate_style and "win_rate" in metric and filtered_values and filtered_steps[0] > 0:
+            # Ensure the curve anchors at the true origin for win-rate plots.
+            filtered_steps.insert(0, 0.0)
+            filtered_values.insert(0, 0.0)
         if not filtered_values:
             print(f"[WARN] '{metric}' not present for run {run['label']}, skipping.")
             continue
-        smoothed = moving_average(filtered_values, smooth)
-        x_vals = filtered_steps[: len(smoothed)]
+        # For win-rate plots, left-pad zeros to let smoothing start from origin smoothly.
+        if args.winrate_style and "win_rate" in metric and smooth > 1:
+            pad_len = smooth - 1
+            padded_vals = [0.0] * pad_len + filtered_values
+            padded_steps = [0.0] * pad_len + filtered_steps
+            smoothed = moving_average(padded_vals, smooth)
+            # Drop the padded prefix so lengths match the original data.
+            smoothed = smoothed[pad_len:]
+            x_vals = padded_steps[pad_len : pad_len + len(smoothed)]
+            if x_vals:
+                x_vals[0] = 0.0
+                smoothed[0] = 0.0
+        else:
+            smoothed = moving_average(filtered_values, smooth)
+            x_vals = filtered_steps[: len(smoothed)]
         plt.plot(x_vals, smoothed, linewidth=2, label=f"{run['label']} (window={smooth})")
         if args.winrate_style and not args.no_fill:
             plt.fill_between(x_vals, smoothed, alpha=args.fill_alpha)

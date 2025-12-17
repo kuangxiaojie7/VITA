@@ -162,7 +162,7 @@ class VITAAgent(torch.nn.Module):
         masks: torch.Tensor,
         avail_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        self_feat, _ = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
+        self_feat, next_actor = self.actor_encoder(obs_seq, rnn_states_actor.unsqueeze(0), masks)
         if (not self.comm_enabled) or (self.comm_strength <= 0.0):
             comm_feat = torch.zeros_like(self_feat)
             kl_loss = torch.zeros(1, device=self_feat.device)
@@ -199,7 +199,7 @@ class VITAAgent(torch.nn.Module):
         log_probs = dist.log_prob(actions.squeeze(-1)).unsqueeze(-1)
         entropy = dist.entropy().unsqueeze(-1)
 
-        critic_feat, _ = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
+        critic_feat, next_critic = self.critic_encoder(state.unsqueeze(1), rnn_states_critic.unsqueeze(0), masks)
         critic_feat = self.critic_mlp(critic_feat)
         values = self.value_head(critic_feat)
         return {
@@ -208,6 +208,8 @@ class VITAAgent(torch.nn.Module):
             "values": values,
             "kl_loss": kl_loss,
             "trust_loss": trust_loss,
+            "next_actor_state": next_actor.squeeze(0),
+            "next_critic_state": next_critic.squeeze(0),
         }
 
     def get_values(

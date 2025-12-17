@@ -98,12 +98,24 @@ class SMACWrapper:
                         env_actions[agent_id] = 0
             reward, terminated, info = env.step(env_actions.tolist())
             reward *= self.cfg.reward_scale
+            episode_info = info or {}
             if terminated:
+                terminal_obs = np.stack(env.get_obs())
+                terminal_state = env.get_state()
+                terminal_avail = np.stack(env.get_avail_actions())
                 try:
                     episode_stats = env.get_stats()
                 except ZeroDivisionError:
                     episode_stats = {}
-                info = {**episode_stats, **(info or {})}
+                episode_info = {
+                    **episode_stats,
+                    **episode_info,
+                    "terminal_obs": terminal_obs,
+                    "terminal_state": terminal_state,
+                    "terminal_avail": terminal_avail,
+                }
+                # Keep env state in sync with returned observation: reset immediately on termination.
+                env.reset()
             next_obs = np.stack(env.get_obs())
             state = env.get_state()
             avail = np.stack(env.get_avail_actions())
@@ -112,9 +124,7 @@ class SMACWrapper:
             reward_list.append(np.full((self.n_agents,), reward, dtype=np.float32))
             done_list.append(np.array([terminated] * self.n_agents))
             avail_list.append(avail)
-            info_list.append(info)
-            if terminated:
-                env.reset()
+            info_list.append(episode_info)
         next_obs = np.stack(next_obs_list)
         next_obs = self._process_obs(next_obs)
         self._update_agent_metadata()
