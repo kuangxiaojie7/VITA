@@ -36,12 +36,12 @@ train:
   entropy_coef: 0.01
   value_loss_coef: 0.5
   max_grad_norm: 10.0
-  trust_warmup_updates: 100
-  kl_warmup_updates: 0
-  trust_delay_updates: 200
+  trust_warmup_updates: 60
+  kl_warmup_updates: 50
+  trust_delay_updates: 20
   kl_delay_updates: 0
-  comm_delay_updates: 120
-  comm_warmup_updates: 220
-  comm_full_warmup_updates: 240
+  comm_delay_updates: 20
+  comm_warmup_updates: 80
+  comm_full_warmup_updates: 120
   eval_interval_updates: 20
   eval_episodes: 32

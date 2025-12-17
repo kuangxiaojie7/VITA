@@ -83,9 +83,9 @@ def plot_metric(
         smoothed = moving_average(filtered_values, smooth)
         x_vals = filtered_steps[: len(smoothed)]
         plt.plot(x_vals, smoothed, linewidth=2, label=f"{run['label']} (window={smooth})")
-        if args.winrate_style:
-            plt.fill_between(x_vals, smoothed, alpha=0.15)
-    plt.title(metric)
+        if args.winrate_style and not args.no_fill:
+            plt.fill_between(x_vals, smoothed, alpha=args.fill_alpha)
+    plt.title(args.title or metric)
     _format_axes(metric, args)
     if not args.winrate_style:
         plt.grid(True, alpha=0.3)
@@ -124,6 +124,12 @@ def main() -> None:
     )
     parser.add_argument("--smooth", type=int, default=10, help="Moving-average window size.")
     parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Optional figure title override (defaults to metric name).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -139,6 +145,17 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Environment timesteps represented by one training update (used when --winrate-style).",
+    )
+    parser.add_argument(
+        "--no-fill",
+        action="store_true",
+        help="Disable the filled area under curves in --winrate-style plots.",
+    )
+    parser.add_argument(
+        "--fill-alpha",
+        type=float,
+        default=0.15,
+        help="Alpha used for the filled area (ignored when --no-fill).",
     )
     args = parser.parse_args()
 
