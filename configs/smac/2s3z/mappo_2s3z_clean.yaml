@@ -16,7 +16,7 @@ model:
   max_neighbors: 4
   history_length: 1
 train:
-  episode_length: 400    # avoid truncating battles on 2s3z
+  episode_length: 120    # 2s3z typically ends in ~60-80 steps; 120 trims tail
   updates: 3000          # ~9.6M steps
   lr: 0.0005
   gamma: 0.99

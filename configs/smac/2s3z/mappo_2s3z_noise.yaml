@@ -16,7 +16,7 @@ model:
   max_neighbors: 4
   history_length: 1
 train:
-  episode_length: 400
+  episode_length: 120
   updates: 3000
   lr: 0.0005
   gamma: 0.99

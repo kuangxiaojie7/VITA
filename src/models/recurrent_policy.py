@@ -114,6 +114,36 @@ class RecurrentMAPPOPolicy(nn.Module):
         values, _ = self._critic_forward(state, rnn_states_critic, masks)
         return action_log_probs, dist_entropy, values
 
+    def evaluate_actions_sequence(
+        self,
+        obs_seq: torch.Tensor,
+        state_seq: torch.Tensor,
+        actions_seq: torch.Tensor,
+        rnn_states_actor: torch.Tensor,
+        rnn_states_critic: torch.Tensor,
+        masks_seq: torch.Tensor,
+        avail_actions_seq: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sequence-aware evaluate_actions for truncated BPTT."""
+        log_probs_steps = []
+        entropy_steps = []
+        values_steps = []
+        actor_state = rnn_states_actor
+        critic_state = rnn_states_critic
+        for t in range(obs_seq.size(0)):
+            logits, actor_state = self._actor_forward(obs_seq[t], actor_state, masks_seq[t])
+            logits = self._mask_logits(logits, avail_actions_seq[t])
+            dist = Categorical(logits=logits)
+            log_probs_steps.append(dist.log_prob(actions_seq[t].squeeze(-1)).unsqueeze(-1))
+            entropy_steps.append(dist.entropy().unsqueeze(-1))
+            values, critic_state = self._critic_forward(state_seq[t], critic_state, masks_seq[t])
+            values_steps.append(values)
+        return (
+            torch.stack(log_probs_steps, dim=0),
+            torch.stack(entropy_steps, dim=0),
+            torch.stack(values_steps, dim=0),
+        )
+
     def get_values(
         self, state: torch.Tensor, rnn_states_critic: torch.Tensor, masks: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

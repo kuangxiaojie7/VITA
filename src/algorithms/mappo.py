@@ -133,9 +133,10 @@ class MAPPOTrainer:
                     rewards = self.reward_norm.normalize(raw_rewards, use_mean=False)
                     dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                     next_avail = torch.from_numpy(next_avail_np).float().to(self.device)
-                    next_active_masks = (
-                        torch.from_numpy(self.env.get_agent_alive_mask()).float().to(self.device).unsqueeze(-1)
+                    alive_masks_np = np.stack(
+                        [info.get("alive_mask", np.ones(self.num_agents, dtype=np.float32)) for info in info_list]
                     )
+                    next_active_masks = torch.from_numpy(alive_masks_np).float().to(self.device).unsqueeze(-1)
 
                     episode_rewards += raw_rewards.mean().item()
 
@@ -186,6 +187,7 @@ class MAPPOTrainer:
                 with torch.no_grad():
                     next_values, _ = self.policy.get_values(flat_state, flat_critic, flat_masks)
                 next_values = next_values.view(self.num_envs, self.num_agents, 1)
+                # Denormalize value predictions for GAE; targets will be normalized in the loss.
                 denorm_next_values = self.value_norm.denormalize(next_values, use_mean=True)
                 self.buffer.values.copy_(self.value_norm.denormalize(self.buffer.values, use_mean=True))
                 self.buffer.compute_returns(denorm_next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
@@ -207,6 +209,7 @@ class MAPPOTrainer:
             self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
+        # Update value normalizer with raw returns (PopArt-style).
         self.value_norm.update(self.buffer.returns[:-1].detach().cpu().numpy())
         advantages = self.buffer.advantages[:-1]
         active_masks = self.buffer.active_masks[:-1]
@@ -250,21 +253,15 @@ class MAPPOTrainer:
                     rnn_actor = batch["rnn_states_actor"].float()  # [N, hidden]
                     rnn_critic = batch["rnn_states_critic"].float()
 
-                    log_probs_steps = []
-                    entropy_steps = []
-                    values_steps = []
-                    for t in range(obs_seq.size(0)):
-                        logits, rnn_actor = self.policy._actor_forward(obs_seq[t], rnn_actor, masks_seq[t])
-                        logits = self.policy._mask_logits(logits, avail_seq[t])
-                        dist = Categorical(logits=logits)
-                        log_probs_steps.append(dist.log_prob(actions_seq[t].squeeze(-1)).unsqueeze(-1))
-                        entropy_steps.append(dist.entropy().unsqueeze(-1))
-                        values, rnn_critic = self.policy._critic_forward(state_seq[t], rnn_critic, masks_seq[t])
-                        values_steps.append(values)
-
-                    log_probs = torch.stack(log_probs_steps, dim=0)
-                    entropy = torch.stack(entropy_steps, dim=0)
-                    values = torch.stack(values_steps, dim=0)
+                    log_probs, entropy, values = self.policy.evaluate_actions_sequence(
+                        obs_seq,
+                        state_seq,
+                        actions_seq,
+                        rnn_actor,
+                        rnn_critic,
+                        masks_seq,
+                        avail_seq,
+                    )
                     ratio = torch.exp(log_probs - old_log_probs_seq)
                     surr1 = ratio * advantages_seq
                     surr2 = torch.clamp(

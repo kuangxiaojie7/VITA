@@ -201,7 +201,10 @@ class VITATrainer:
                     rewards = self.reward_norm.normalize(raw_rewards, use_mean=False)
                     dones = torch.from_numpy(done_np.astype(float)).unsqueeze(-1).to(self.device)
                     reward_sum += raw_rewards.mean().item()
-                    next_active_masks = self.current_alive_mask.unsqueeze(-1).float()
+                    alive_masks_np = np.stack(
+                        [info.get("alive_mask", np.ones(self.num_agents, dtype=np.float32)) for info in info_list]
+                    )
+                    next_active_masks = torch.from_numpy(alive_masks_np).float().to(self.device).unsqueeze(-1)
 
                     next_actor_states = next_actor.view(self.num_envs, self.num_agents, -1).detach()
                     next_critic_states = next_critic.view(self.num_envs, self.num_agents, -1).detach()
@@ -276,6 +279,7 @@ class VITATrainer:
             self._close_eval_env()
 
     def update_policy(self) -> Dict[str, float]:
+        # Update value normalizer with raw returns (PopArt-style).
         self.value_norm.update(self.buffer.returns[:-1].detach().cpu().numpy())
         advantages = self.buffer.advantages[:-1]
         active_masks = self.buffer.active_masks[:-1]
