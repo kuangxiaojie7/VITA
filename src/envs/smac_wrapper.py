@@ -98,7 +98,7 @@ class SMACWrapper:
                         env_actions[agent_id] = 0
             reward, terminated, info = env.step(env_actions.tolist())
             reward *= self.cfg.reward_scale
-            episode_info = info or {}
+            episode_info = dict(info or {})
             # Capture alive mask before any reset to preserve terminal step masks.
             alive_mask = np.zeros((self.n_agents,), dtype=np.float32)
             for agent_id in range(self.n_agents):
@@ -109,6 +109,8 @@ class SMACWrapper:
                 if unit is None:
                     continue
                 alive_mask[agent_id] = 1.0 if getattr(unit, "health", 0.0) > 0 else 0.0
+            bad_transition = bool(episode_info.get("bad_transition", False) or episode_info.get("episode_limit", False))
+            episode_info["bad_transition"] = bad_transition
             if terminated:
                 terminal_obs = np.stack(env.get_obs())
                 terminal_state = env.get_state()

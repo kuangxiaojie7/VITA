@@ -27,6 +27,7 @@ class TrainParams:
     use_recurrent_generator: bool = True
     use_policy_active_masks: bool = True
     use_value_active_masks: bool = True
+    use_clipped_value_loss: bool = True
     entropy_coef: float = 0.01
     value_loss_coef: float = 0.5
     max_grad_norm: float = 10.0
@@ -137,6 +138,17 @@ class MAPPOTrainer:
                         [info.get("alive_mask", np.ones(self.num_agents, dtype=np.float32)) for info in info_list]
                     )
                     next_active_masks = torch.from_numpy(alive_masks_np).float().to(self.device).unsqueeze(-1)
+                    bad_masks_np = np.stack(
+                        [
+                            np.full(
+                                (self.num_agents,),
+                                0.0 if bool(info.get("bad_transition", False)) else 1.0,
+                                dtype=np.float32,
+                            )
+                            for info in info_list
+                        ]
+                    )
+                    bad_masks = torch.from_numpy(bad_masks_np).float().to(self.device).unsqueeze(-1)
 
                     episode_rewards += raw_rewards.mean().item()
 
@@ -161,6 +173,7 @@ class MAPPOTrainer:
                         reshaped_values,
                         rewards,
                         dones,
+                        bad_masks,
                         next_active_masks,
                         neighbor_obs_tensor,
                         neighbor_action_tensor,
@@ -187,10 +200,12 @@ class MAPPOTrainer:
                 with torch.no_grad():
                     next_values, _ = self.policy.get_values(flat_state, flat_critic, flat_masks)
                 next_values = next_values.view(self.num_envs, self.num_agents, 1)
-                # Denormalize value predictions for GAE; targets will be normalized in the loss.
-                denorm_next_values = self.value_norm.denormalize(next_values, use_mean=True)
-                self.buffer.values.copy_(self.value_norm.denormalize(self.buffer.values, use_mean=True))
-                self.buffer.compute_returns(denorm_next_values, self.train_cfg.gamma, self.train_cfg.gae_lambda)
+                self.buffer.compute_returns(
+                    next_values,
+                    self.train_cfg.gamma,
+                    self.train_cfg.gae_lambda,
+                    value_normalizer=self.value_norm,
+                )
                 loss_dict = self.update_policy()
 
                 eval_metrics = {}
@@ -231,6 +246,7 @@ class MAPPOTrainer:
         use_recurrent = bool(self.train_cfg.use_recurrent_generator and self.train_cfg.data_chunk_length > 1)
         use_policy_active = bool(self.train_cfg.use_policy_active_masks)
         use_value_active = bool(self.train_cfg.use_value_active_masks)
+        use_value_clip = bool(self.train_cfg.use_clipped_value_loss)
         for _ in range(self.train_cfg.ppo_epochs):
             if use_recurrent:
                 data_iter = self.buffer.recurrent_generator(
@@ -245,6 +261,7 @@ class MAPPOTrainer:
                     state_seq = batch["states"].float()  # [L, N, state_dim]
                     actions_seq = batch["actions"]  # [L, N, 1]
                     old_log_probs_seq = batch["old_log_probs"]  # [L, N, 1]
+                    value_preds_seq = batch["value_preds"].float()  # [L, N, 1]
                     returns_seq = batch["returns"]  # [L, N, 1]
                     advantages_seq = batch["advantages"]  # [L, N, 1]
                     masks_seq = batch["masks"].float()  # [L, N, 1]
@@ -277,7 +294,16 @@ class MAPPOTrainer:
                         entropy_loss = entropy.mean()
 
                     norm_returns = self.value_norm.normalize(returns_seq, use_mean=True)
-                    value_loss_terms = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    value_pred_clipped = value_preds_seq + (values - value_preds_seq).clamp(
+                        -self.train_cfg.clip_param, self.train_cfg.clip_param
+                    )
+                    value_loss_original = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    value_loss_clipped = F.huber_loss(value_pred_clipped, norm_returns, delta=10.0, reduction="none")
+                    value_loss_terms = (
+                        torch.max(value_loss_original, value_loss_clipped)
+                        if use_value_clip
+                        else value_loss_original
+                    )
                     if use_value_active:
                         value_loss = (value_loss_terms * active_seq).sum() / active_denom
                     else:
@@ -287,6 +313,7 @@ class MAPPOTrainer:
                     state_batch = batch["states"].float()
                     actions_batch = batch["actions"]
                     old_log_probs_batch = batch["old_log_probs"]
+                    value_preds_batch = batch["value_preds"].float()
                     returns_batch = batch["returns"]
                     advantages_batch = batch["advantages"]
                     masks_batch = batch["masks"].float()
@@ -319,7 +346,16 @@ class MAPPOTrainer:
                         entropy_loss = entropy.mean()
 
                     norm_returns = self.value_norm.normalize(returns_batch, use_mean=True)
-                    value_loss_terms = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(
+                        -self.train_cfg.clip_param, self.train_cfg.clip_param
+                    )
+                    value_loss_original = F.huber_loss(values, norm_returns, delta=10.0, reduction="none")
+                    value_loss_clipped = F.huber_loss(value_pred_clipped, norm_returns, delta=10.0, reduction="none")
+                    value_loss_terms = (
+                        torch.max(value_loss_original, value_loss_clipped)
+                        if use_value_clip
+                        else value_loss_original
+                    )
                     if use_value_active:
                         value_loss = (value_loss_terms * active_batch).sum() / active_denom
                     else:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterator
+from typing import Any, Dict, Iterator
 
 import torch
 
@@ -17,6 +17,7 @@ class EpisodeBatch:
     returns: torch.Tensor
     advantages: torch.Tensor
     masks: torch.Tensor
+    bad_masks: torch.Tensor
     active_masks: torch.Tensor
     rewards: torch.Tensor
     neighbor_obs: torch.Tensor
@@ -64,6 +65,7 @@ class MAPPOBuffer:
         self.values = torch.zeros(episode_length + 1, num_envs, num_agents, 1, device=device)
         self.rewards = torch.zeros(episode_length, num_envs, num_agents, 1, device=device)
         self.masks = torch.ones(episode_length + 1, num_envs, num_agents, 1, device=device)
+        self.bad_masks = torch.ones(episode_length + 1, num_envs, num_agents, 1, device=device)
         self.active_masks = torch.ones(episode_length + 1, num_envs, num_agents, 1, device=device)
         self.returns = torch.zeros_like(self.values)
         self.advantages = torch.zeros_like(self.values)
@@ -105,6 +107,7 @@ class MAPPOBuffer:
         rnn_states_actor: torch.Tensor,
         rnn_states_critic: torch.Tensor,
         active_masks: torch.Tensor | None = None,
+        bad_masks: torch.Tensor | None = None,
     ) -> None:
         self.obs[0].copy_(obs)
         self.states[0].copy_(state)
@@ -112,6 +115,10 @@ class MAPPOBuffer:
         self.rnn_states_critic[0].copy_(rnn_states_critic)
         if active_masks is not None:
             self.active_masks[0].copy_(active_masks)
+        if bad_masks is not None:
+            self.bad_masks[0].copy_(bad_masks)
+        else:
+            self.bad_masks[0].fill_(1.0)
         self.step = 0
 
     def insert(
@@ -125,6 +132,7 @@ class MAPPOBuffer:
         values: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        bad_masks: torch.Tensor | None,
         active_masks: torch.Tensor | None,
         neighbor_obs: torch.Tensor,
         neighbor_actions: torch.Tensor,
@@ -142,6 +150,10 @@ class MAPPOBuffer:
         self.values[self.step].copy_(values)
         self.rewards[self.step].copy_(rewards)
         self.masks[self.step + 1].copy_(1.0 - dones)
+        if bad_masks is not None:
+            self.bad_masks[self.step + 1].copy_(bad_masks)
+        else:
+            self.bad_masks[self.step + 1].fill_(1.0)
         if active_masks is not None:
             self.active_masks[self.step + 1].copy_(active_masks)
         if neighbor_masks is None:
@@ -154,20 +166,38 @@ class MAPPOBuffer:
         self.avail_actions[self.step].copy_(avail_actions)
         self.step = (self.step + 1) % self.episode_length
 
-    def compute_returns(self, last_values: torch.Tensor, gamma: float, gae_lambda: float) -> None:
+    def compute_returns(
+        self,
+        last_values: torch.Tensor,
+        gamma: float,
+        gae_lambda: float,
+        *,
+        value_normalizer: Any | None = None,
+    ) -> None:
+        """Compute GAE-lambda returns.
+
+        When ``value_normalizer`` is provided, ``self.values`` are treated as normalized
+        predictions and are denormalized inside this function to compute deltas/returns.
+        """
         self.values[-1] = last_values
         gae = torch.zeros_like(last_values)
         for step in reversed(range(self.episode_length)):
-            delta = (
-                self.rewards[step]
-                + gamma * self.values[step + 1] * self.masks[step + 1]
-                - self.values[step]
-            )
+            if value_normalizer is not None:
+                v_next = value_normalizer.denormalize(self.values[step + 1], use_mean=True)
+                v_curr = value_normalizer.denormalize(self.values[step], use_mean=True)
+            else:
+                v_next = self.values[step + 1]
+                v_curr = self.values[step]
+            delta = self.rewards[step] + gamma * v_next * self.masks[step + 1] - v_curr
             gae = delta + gamma * gae_lambda * self.masks[step + 1] * gae
+            gae = gae * self.bad_masks[step + 1]
             self.advantages[step] = gae
+            self.returns[step] = gae + v_curr
         self.advantages[-1].zero_()
-        self.returns[:-1] = self.advantages[:-1] + self.values[:-1]
-        self.returns[-1].copy_(self.values[-1])
+        if value_normalizer is not None:
+            self.returns[-1] = value_normalizer.denormalize(self.values[-1], use_mean=True)
+        else:
+            self.returns[-1].copy_(self.values[-1])
 
     def after_update(self) -> None:
         self.obs[0].copy_(self.obs[-1])
@@ -175,6 +205,7 @@ class MAPPOBuffer:
         self.rnn_states_actor[0].copy_(self.rnn_states_actor[-1])
         self.rnn_states_critic[0].copy_(self.rnn_states_critic[-1])
         self.masks[0].copy_(self.masks[-1])
+        self.bad_masks[0].copy_(self.bad_masks[-1])
         self.active_masks[0].copy_(self.active_masks[-1])
 
     def get_episode_batch(self) -> EpisodeBatch:
@@ -188,6 +219,7 @@ class MAPPOBuffer:
             returns=self.returns[:-1].clone(),
             advantages=self.advantages[:-1].clone(),
             masks=self.masks[:-1].clone(),
+            bad_masks=self.bad_masks[:-1].clone(),
             active_masks=self.active_masks[:-1].clone(),
             rewards=self.rewards.clone(),
             neighbor_obs=self.neighbor_obs.clone(),
@@ -209,6 +241,7 @@ class MAPPOBuffer:
         states = self.states[:-1].repeat_interleave(self.num_agents, dim=1).reshape(-1, self.state_dim)
         actions = self.actions.reshape(-1, 1)
         old_log_probs = self.log_probs.reshape(-1, 1)
+        value_preds = self.values[:-1].reshape(-1, 1)
         returns = self.returns[:-1].reshape(-1, 1)
         advantages = advantages.reshape(-1, 1)
         masks = self.masks[:-1].reshape(-1, 1)
@@ -247,6 +280,7 @@ class MAPPOBuffer:
                 "states": states[mb_idx],
                 "actions": actions[mb_idx],
                 "old_log_probs": old_log_probs[mb_idx],
+                "value_preds": value_preds[mb_idx],
                 "returns": returns[mb_idx],
                 "advantages": advantages[mb_idx],
                 "masks": masks[mb_idx],
@@ -298,6 +332,7 @@ class MAPPOBuffer:
         )
         actions_steps = self.actions[:usable_len].reshape(usable_len, threads, 1)
         logp_steps = self.log_probs[:usable_len].reshape(usable_len, threads, 1)
+        value_steps = self.values[:-1][:usable_len].reshape(usable_len, threads, 1)
         returns_steps = self.returns[:-1][:usable_len].reshape(usable_len, threads, 1)
         adv_steps = advantages[:usable_len].reshape(usable_len, threads, 1)
         masks_steps = self.masks[:-1][:usable_len].reshape(usable_len, threads, 1)
@@ -334,6 +369,7 @@ class MAPPOBuffer:
         state_chunks = _make_chunks(state_steps)
         actions_chunks = _make_chunks(actions_steps)
         logp_chunks = _make_chunks(logp_steps)
+        value_chunks = _make_chunks(value_steps)
         returns_chunks = _make_chunks(returns_steps)
         adv_chunks = _make_chunks(adv_steps)
         masks_chunks = _make_chunks(masks_steps)
@@ -360,6 +396,7 @@ class MAPPOBuffer:
                 "states": state_chunks[chunk_idx].transpose(0, 1).contiguous(),
                 "actions": actions_chunks[chunk_idx].transpose(0, 1).contiguous(),
                 "old_log_probs": logp_chunks[chunk_idx].transpose(0, 1).contiguous(),
+                "value_preds": value_chunks[chunk_idx].transpose(0, 1).contiguous(),
                 "returns": returns_chunks[chunk_idx].transpose(0, 1).contiguous(),
                 "advantages": adv_chunks[chunk_idx].transpose(0, 1).contiguous(),
                 "masks": masks_chunks[chunk_idx].transpose(0, 1).contiguous(),
