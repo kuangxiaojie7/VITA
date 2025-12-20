@@ -5,16 +5,13 @@ env:
   name: smac
   map_name: "2s3z"
   difficulty: "7"
-  num_envs: 8            # 8 envs * 400 steps = 3200 batch size
+  num_envs: 8            # 8 envs * 120 steps = 960 steps/update
   reward_scale: 1.0
   obs_noise_std: 0.0
   packet_drop_prob: 0.0
   malicious_agent_prob: 0.0
 model:
   hidden_dim: 64         # SMAC 2s3z: lighter net suffices
-  activation: relu
-  max_neighbors: 4
-  history_length: 1
 train:
   episode_length: 120    # 2s3z typically ends in ~60-80 steps; 120 trims tail
   updates: 3000          # ~9.6M steps

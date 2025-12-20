@@ -12,9 +12,6 @@ env:
   malicious_agent_prob: 0.05
 model:
   hidden_dim: 128
-  activation: relu
-  max_neighbors: 4
-  history_length: 1
 train:
   episode_length: 120
   updates: 1000

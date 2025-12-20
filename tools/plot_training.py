@@ -69,6 +69,12 @@ def plot_metric(
         filtered_steps: List[float] = []
         filtered_values: List[float] = []
         for idx, entry in enumerate(entries):
+            if args.phase != "all":
+                phase = entry.get("phase")
+                if phase is None:
+                    phase = "eval" if any(k.startswith("eval_") for k in entry.keys()) else "train"
+                if phase != args.phase:
+                    continue
             val = entry.get(metric)
             if val is None:
                 continue
@@ -137,7 +143,7 @@ def main() -> None:
     parser.add_argument(
         "--metrics",
         type=str,
-        default="episode_reward,policy_loss,value_loss,eval_win_rate",
+        default="episode_reward,policy_loss,value_loss,incre_win_rate,eval_win_rate",
         help="Comma-separated metric names to visualize.",
     )
     parser.add_argument("--smooth", type=int, default=10, help="Moving-average window size.")
@@ -157,6 +163,13 @@ def main() -> None:
         "--winrate-style",
         action="store_true",
         help="Format plots similar to SMAC win-rate figures (T mil on x-axis, percentage on y-axis).",
+    )
+    parser.add_argument(
+        "--phase",
+        type=str,
+        choices=["all", "train", "eval"],
+        default="all",
+        help="Filter log entries by phase (newer logs include `phase`; older logs are inferred).",
     )
     parser.add_argument(
         "--timesteps-per-update",

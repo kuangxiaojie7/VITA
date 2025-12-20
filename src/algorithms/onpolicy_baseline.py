@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _external_onpolicy_root() -> Path:
+    return _repo_root() / "external" / "on-policy"
+
+
+def _as_int(value: Any, *, name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected int for '{name}', got: {value!r}") from exc
+
+
+def _as_float(value: Any, *, name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected float for '{name}', got: {value!r}") from exc
+
+
+def _flag_store_false(args: List[str], flag: str, desired: bool) -> None:
+    """on-policy uses many `action='store_false', default=True` flags.
+
+    If desired is False, we need to pass `--<flag>` to flip it to False.
+    """
+    if not desired:
+        args.append(f"--{flag}")
+
+
+def _flag_store_true(args: List[str], flag: str, desired: bool) -> None:
+    if desired:
+        args.append(f"--{flag}")
+
+
+def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[str]:
+    env_cfg = cfg.get("env") or {}
+    train_cfg = cfg.get("train") or {}
+    model_cfg = cfg.get("model") or {}
+    onpolicy_cfg = cfg.get("onpolicy") or {}
+
+    map_name = env_cfg.get("map_name")
+    if not map_name:
+        raise ValueError("Missing `env.map_name` in config.")
+
+    seed = _as_int(cfg.get("seed", 42), name="seed")
+
+    num_envs = _as_int(env_cfg.get("num_envs", 1), name="env.num_envs")
+    episode_length = _as_int(train_cfg.get("episode_length"), name="train.episode_length")
+
+    updates = _as_int(train_cfg.get("updates"), name="train.updates")
+    num_env_steps = _as_int(
+        train_cfg.get("num_env_steps", updates * episode_length * num_envs),
+        name="train.num_env_steps",
+    )
+
+    experiment_name = str(cfg.get("experiment_name") or cfg.get("experiment") or config_path.stem)
+
+    top_algo = str(cfg.get("algorithm") or "").lower()
+    default_algorithm = "rvita" if top_algo in {"vita", "rvita"} else "rmappo"
+    algorithm_name = str(onpolicy_cfg.get("algorithm_name") or default_algorithm)
+    env_name = str(onpolicy_cfg.get("env_name") or "StarCraft2")
+
+    args: List[str] = []
+    args += ["--env_name", env_name]
+    args += ["--map_name", str(map_name)]
+    args += ["--algorithm_name", algorithm_name]
+    args += ["--experiment_name", experiment_name]
+    args += ["--seed", str(seed)]
+
+    hidden_size = _as_int(model_cfg.get("hidden_dim", 64), name="model.hidden_dim")
+    args += ["--hidden_size", str(hidden_size)]
+
+    args += ["--n_training_threads", str(_as_int(train_cfg.get("n_training_threads", 1), name="train.n_training_threads"))]
+    args += ["--n_rollout_threads", str(num_envs)]
+    args += ["--n_eval_rollout_threads", str(_as_int(train_cfg.get("n_eval_rollout_threads", 1), name="train.n_eval_rollout_threads"))]
+
+    args += ["--episode_length", str(episode_length)]
+    args += ["--num_env_steps", str(num_env_steps)]
+
+    # Optimizer / PPO hyperparameters.
+    lr = _as_float(train_cfg.get("lr", 5e-4), name="train.lr")
+    critic_lr = _as_float(train_cfg.get("critic_lr", lr), name="train.critic_lr")
+    args += ["--lr", str(lr)]
+    args += ["--critic_lr", str(critic_lr)]
+    args += ["--opti_eps", str(_as_float(train_cfg.get("opti_eps", 1e-5), name="train.opti_eps"))]
+    args += ["--weight_decay", str(_as_float(train_cfg.get("weight_decay", 0.0), name="train.weight_decay"))]
+
+    args += ["--gamma", str(_as_float(train_cfg.get("gamma", 0.99), name="train.gamma"))]
+    args += ["--gae_lambda", str(_as_float(train_cfg.get("gae_lambda", 0.95), name="train.gae_lambda"))]
+    args += ["--clip_param", str(_as_float(train_cfg.get("clip_param", 0.2), name="train.clip_param"))]
+
+    ppo_epoch = _as_int(train_cfg.get("ppo_epoch", train_cfg.get("ppo_epochs", 15)), name="train.ppo_epochs")
+    args += ["--ppo_epoch", str(ppo_epoch)]
+    args += ["--num_mini_batch", str(_as_int(train_cfg.get("num_mini_batch", 1), name="train.num_mini_batch"))]
+    args += ["--entropy_coef", str(_as_float(train_cfg.get("entropy_coef", 0.01), name="train.entropy_coef"))]
+    args += ["--value_loss_coef", str(_as_float(train_cfg.get("value_loss_coef", 0.5), name="train.value_loss_coef"))]
+    args += ["--max_grad_norm", str(_as_float(train_cfg.get("max_grad_norm", 10.0), name="train.max_grad_norm"))]
+    args += ["--huber_delta", str(_as_float(train_cfg.get("huber_delta", 10.0), name="train.huber_delta"))]
+
+    args += ["--data_chunk_length", str(_as_int(train_cfg.get("data_chunk_length", 10), name="train.data_chunk_length"))]
+
+    if algorithm_name == "rvita":
+        history_length = _as_int(model_cfg.get("history_length", 1), name="model.history_length")
+        args += ["--stacked_frames", str(history_length)]
+        _flag_store_true(args, "use_stacked_frames", history_length > 1)
+
+        args += ["--vita_latent_dim", str(_as_int(model_cfg.get("latent_dim", 64), name="model.latent_dim"))]
+        args += ["--vita_trust_gamma", str(_as_float(model_cfg.get("trust_gamma", 1.0), name="model.trust_gamma"))]
+        args += ["--vita_kl_beta", str(_as_float(model_cfg.get("kl_beta", 1e-3), name="model.kl_beta"))]
+        args += ["--vita_attn_bias_coef", str(_as_float(model_cfg.get("attn_bias_coef", 1.0), name="model.attn_bias_coef"))]
+        args += ["--vita_trust_lambda", str(_as_float(model_cfg.get("trust_lambda", 0.1), name="model.trust_lambda"))]
+        args += ["--vita_trust_threshold", str(_as_float(model_cfg.get("trust_threshold", 0.0), name="model.trust_threshold"))]
+        args += ["--vita_comm_dropout", str(_as_float(model_cfg.get("comm_dropout", 0.1), name="model.comm_dropout"))]
+        args += ["--vita_comm_sight_range", str(_as_float(model_cfg.get("comm_sight_range", 0.0), name="model.comm_sight_range"))]
+        args += ["--vita_max_neighbors", str(_as_int(model_cfg.get("max_neighbors", 4), name="model.max_neighbors"))]
+        if not bool(model_cfg.get("enable_trust", True)):
+            _flag_store_true(args, "vita_disable_trust", True)
+        if not bool(model_cfg.get("enable_kl", True)):
+            _flag_store_true(args, "vita_disable_kl", True)
+
+        args += ["--vita_trust_warmup_updates", str(_as_int(train_cfg.get("trust_warmup_updates", 0), name="train.trust_warmup_updates"))]
+        args += ["--vita_trust_delay_updates", str(_as_int(train_cfg.get("trust_delay_updates", 0), name="train.trust_delay_updates"))]
+        args += ["--vita_kl_warmup_updates", str(_as_int(train_cfg.get("kl_warmup_updates", 0), name="train.kl_warmup_updates"))]
+        args += ["--vita_kl_delay_updates", str(_as_int(train_cfg.get("kl_delay_updates", 0), name="train.kl_delay_updates"))]
+        args += ["--vita_comm_delay_updates", str(_as_int(train_cfg.get("comm_delay_updates", 0), name="train.comm_delay_updates"))]
+        args += ["--vita_comm_warmup_updates", str(_as_int(train_cfg.get("comm_warmup_updates", 0), name="train.comm_warmup_updates"))]
+        args += ["--vita_comm_full_warmup_updates", str(_as_int(train_cfg.get("comm_full_warmup_updates", 0), name="train.comm_full_warmup_updates"))]
+
+    # Logging / saving.
+    args += ["--log_interval", str(_as_int(train_cfg.get("log_interval", 1), name="train.log_interval"))]
+    args += ["--save_interval", str(_as_int(train_cfg.get("save_interval", 1), name="train.save_interval"))]
+
+    # Disable wandb by default (the upstream parser uses store_false with default=True).
+    _flag_store_false(args, "use_wandb", bool(onpolicy_cfg.get("use_wandb", False)))
+
+    # Torch/CUDA toggle (store_false default=True).
+    _flag_store_false(args, "cuda", bool(cfg.get("cuda", True)))
+
+    # Optional boolean flags (match on-policy arg semantics).
+    _flag_store_true(args, "use_proper_time_limits", bool(train_cfg.get("use_proper_time_limits", False)))
+    _flag_store_false(args, "use_clipped_value_loss", bool(train_cfg.get("use_clipped_value_loss", True)))
+    _flag_store_false(args, "use_huber_loss", bool(train_cfg.get("use_huber_loss", True)))
+    _flag_store_false(args, "use_value_active_masks", bool(train_cfg.get("use_value_active_masks", True)))
+    _flag_store_false(args, "use_policy_active_masks", bool(train_cfg.get("use_policy_active_masks", True)))
+    _flag_store_false(args, "use_max_grad_norm", bool(train_cfg.get("use_max_grad_norm", True)))
+    _flag_store_false(args, "use_gae", bool(train_cfg.get("use_gae", True)))
+    _flag_store_false(args, "use_valuenorm", bool(train_cfg.get("use_valuenorm", True)))
+
+    # Eval settings (store_true default=False).
+    eval_interval = _as_int(train_cfg.get("eval_interval_updates", 0), name="train.eval_interval_updates")
+    eval_episodes = _as_int(train_cfg.get("eval_episodes", 0), name="train.eval_episodes")
+    if eval_interval > 0 and eval_episodes > 0:
+        _flag_store_true(args, "use_eval", True)
+        args += ["--eval_interval", str(eval_interval)]
+        args += ["--eval_episodes", str(eval_episodes)]
+
+    return args
+
+
+def run_onpolicy_smac(cfg: Dict[str, Any], *, config_path: Path, run_dir: Path) -> None:
+    """Run the upstream on-policy SMAC trainer (external/on-policy).
+
+    This is intended for paper baselines: algorithm/runtime is the official implementation,
+    while we only inject output directory + JSON-lines logging for compatibility.
+    """
+    external_root = _external_onpolicy_root()
+    sys.path.insert(0, str(external_root))
+
+    os.environ["ONPOLICY_RUN_DIR"] = str(run_dir)
+    os.environ.setdefault("ONPOLICY_JSON_LOG", "1")
+    env_cfg = cfg.get("env") or {}
+    os.environ["ONPOLICY_OBS_NOISE_STD"] = str(float(env_cfg.get("obs_noise_std", 0.0)))
+    os.environ["ONPOLICY_PACKET_DROP_PROB"] = str(float(env_cfg.get("packet_drop_prob", 0.0)))
+    os.environ["ONPOLICY_MALICIOUS_AGENT_PROB"] = str(float(env_cfg.get("malicious_agent_prob", 0.0)))
+    os.environ["ONPOLICY_REWARD_MULT"] = str(float(env_cfg.get("reward_scale", 1.0)))
+
+    args = build_onpolicy_smac_args(cfg, config_path=config_path)
+
+    from onpolicy.scripts.train import train_smac
+
+    train_smac.main(args)
