@@ -24,6 +24,7 @@ from s2clientprotocol import debug_pb2 as d_pb
 
 import random
 from gym.spaces import Discrete
+import time
 
 races = {
     "R": sc_common.Random,
@@ -335,8 +336,44 @@ class StarCraft2Env(MultiAgentEnv):
 
         # Setting up the interface
         interface_options = sc_pb.InterfaceOptions(raw=True, score=False)
-        self._sc2_proc = self._run_config.start(window_size=self.window_size, want_rgb=False)
-        self._controller = self._sc2_proc.controller
+
+        start_kwargs = {"window_size": self.window_size, "want_rgb": False}
+        port = getattr(self, "_sc2_port", None)
+        if port is not None:
+            try:
+                start_kwargs["port"] = int(port)
+            except Exception:
+                start_kwargs["port"] = port
+
+        launch_exc = None
+        for attempt in range(5):
+            try:
+                self._sc2_proc = self._run_config.start(**start_kwargs)
+                self._controller = self._sc2_proc.controller
+                break
+            except TypeError:
+                # Older pysc2 versions may not accept a user-specified port.
+                if "port" in start_kwargs:
+                    start_kwargs.pop("port", None)
+                    continue
+                raise
+            except Exception as exc:  # includes pysc2 ConnectError / protocol errors
+                launch_exc = exc
+                try:
+                    if self._controller is not None:
+                        self._controller.quit()
+                except Exception:
+                    pass
+                try:
+                    if self._sc2_proc is not None:
+                        self._sc2_proc.close()
+                except Exception:
+                    pass
+                self._controller = None
+                self._sc2_proc = None
+                time.sleep(0.5 + 0.5 * attempt)
+        else:
+            raise launch_exc
 
         # Request to create the game
         create = sc_pb.RequestCreateGame(
@@ -448,7 +485,21 @@ class StarCraft2Env(MultiAgentEnv):
 
     def full_restart(self):
         """Full restart. Closes the SC2 process and launches a new one. """
-        self._sc2_proc.close()
+        try:
+            if self._controller is not None:
+                try:
+                    self._controller.quit()
+                except Exception:
+                    pass
+        finally:
+            try:
+                if self._sc2_proc is not None:
+                    self._sc2_proc.close()
+            except Exception:
+                pass
+        self._controller = None
+        self._sc2_proc = None
+        time.sleep(0.2)
         self._launch()
         self.force_restarts += 1
 

@@ -1,5 +1,5 @@
 algorithm: vita
-seed: 1337
+seed: 42
 cuda: true
 env:
   name: smac

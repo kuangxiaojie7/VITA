@@ -6,6 +6,8 @@ try:
 except ImportError:  # pragma: no cover
     wandb = None
 import socket
+import random
+from contextlib import closing
 try:
     import setproctitle  # type: ignore
 except ImportError:  # pragma: no cover
@@ -26,6 +28,59 @@ def _env_float(name: str, default: float = 0.0) -> float:
         return float(value)
     except ValueError:
         return float(default)
+
+
+def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, int(port)))
+        except OSError:
+            return False
+        return True
+
+
+def _pick_sc2_port_base(total_ports: int, *, step: int, host: str = "127.0.0.1") -> int:
+    start = int(os.environ.get("ONPOLICY_SC2_PORT_START", "12000"))
+    end = int(os.environ.get("ONPOLICY_SC2_PORT_END", "60000"))
+    preferred = os.environ.get("ONPOLICY_SC2_BASE_PORT")
+
+    total_ports = max(1, int(total_ports))
+    step = max(1, int(step))
+
+    max_base = end - step * (total_ports + 1)
+    if max_base <= start:
+        raise ValueError(f"Invalid SC2 port range: start={start}, end={end}, step={step}, total={total_ports}")
+
+    if preferred is not None:
+        base = int(preferred)
+        ports = [base + i * step for i in range(total_ports)]
+        if all(_is_port_free(p, host=host) for p in ports):
+            return base
+        raise RuntimeError(f"ONPOLICY_SC2_BASE_PORT={base} not available (ports {ports[:5]}...)")
+
+    for _ in range(256):
+        base = random.randrange(start, max_base)
+        base -= base % step
+        ports = [base + i * step for i in range(total_ports)]
+        if all(_is_port_free(p, host=host) for p in ports):
+            return base
+
+    # Fall back to a deterministic base even if we can't pre-validate availability.
+    return start
+
+
+def _ensure_sc2_ports(all_args) -> None:
+    if getattr(all_args, "_sc2_port_base", None) is not None:
+        return
+
+    step = int(os.environ.get("ONPOLICY_SC2_PORT_STEP", "10"))
+    n_train = int(getattr(all_args, "n_rollout_threads", 1))
+    n_eval = int(getattr(all_args, "n_eval_rollout_threads", 0)) if getattr(all_args, "use_eval", False) else 0
+    base = _pick_sc2_port_base(n_train + n_eval, step=step)
+
+    all_args._sc2_port_base = int(base)
+    all_args._sc2_port_step = int(step)
 
 
 class NoisyEnvWrapper:
@@ -176,11 +231,15 @@ def parse_smacv2_distribution(args):
     return distribution_config
 
 def make_train_env(all_args):
+    if all_args.env_name == "StarCraft2":
+        _ensure_sc2_ports(all_args)
+
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "StarCraft2":
                 from onpolicy.envs.starcraft2.StarCraft2_Env import StarCraft2Env
                 env = StarCraft2Env(all_args)
+                env._sc2_port = all_args._sc2_port_base + rank * all_args._sc2_port_step
                 env = maybe_wrap_noise(env)
             elif all_args.env_name == "StarCraft2v2":
                 from onpolicy.envs.starcraft2.SMACv2_modified import SMACv2
@@ -206,11 +265,16 @@ def make_train_env(all_args):
 
 
 def make_eval_env(all_args):
+    if all_args.env_name == "StarCraft2":
+        _ensure_sc2_ports(all_args)
+
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "StarCraft2":
                 from onpolicy.envs.starcraft2.StarCraft2_Env import StarCraft2Env
                 env = StarCraft2Env(all_args)
+                offset = int(getattr(all_args, "n_rollout_threads", 1))
+                env._sc2_port = all_args._sc2_port_base + (offset + rank) * all_args._sc2_port_step
                 env = maybe_wrap_noise(env)
             elif all_args.env_name == "StarCraft2v2":
                 from onpolicy.envs.starcraft2.SMACv2_modified import SMACv2
