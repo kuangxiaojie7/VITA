@@ -5,7 +5,7 @@ env:
   name: smac
   map_name: "2s3z"
   difficulty: "7"
-  num_envs: 8            # 8 envs * 120 steps = 960 steps/update
+  num_envs: 8            # 8 envs * 400 steps = 3200 env-steps/update
   reward_scale: 1.0
   obs_noise_std: 0.0
   packet_drop_prob: 0.0
@@ -13,8 +13,8 @@ env:
 model:
   hidden_dim: 64         # SMAC 2s3z: lighter net suffices
 train:
-  episode_length: 120    # 2s3z typically ends in ~60-80 steps; 120 trims tail
-  updates: 3000          # ~9.6M steps
+  episode_length: 400    # paper SMAC "buffer length" (rollout horizon per update)
+  updates: 1500          
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
