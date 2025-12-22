@@ -84,12 +84,13 @@ def _ensure_sc2_ports(all_args) -> None:
 
 
 class NoisyEnvWrapper:
-    """Applies observation noise / packet drop / malicious action perturbations.
+    """Applies observation noise / packet drop / malicious observation perturbations.
 
     Controlled via env vars (inherited by subprocess vec envs):
       - ONPOLICY_OBS_NOISE_STD
       - ONPOLICY_PACKET_DROP_PROB
       - ONPOLICY_MALICIOUS_AGENT_PROB
+      - ONPOLICY_MALICIOUS_OBS_NOISE_SCALE
       - ONPOLICY_REWARD_MULT
 
     Defaults are no-op (0/1), so the clean "official baseline" remains unchanged.
@@ -102,12 +103,14 @@ class NoisyEnvWrapper:
         obs_noise_std: float = 0.0,
         packet_drop_prob: float = 0.0,
         malicious_agent_prob: float = 0.0,
+        malicious_obs_noise_scale: float = 3.0,
         reward_mult: float = 1.0,
     ):
         self.env = env
         self.obs_noise_std = float(obs_noise_std)
         self.packet_drop_prob = float(packet_drop_prob)
         self.malicious_agent_prob = float(malicious_agent_prob)
+        self.malicious_obs_noise_scale = float(malicious_obs_noise_scale)
         self.reward_mult = float(reward_mult)
 
         self.observation_space = env.observation_space
@@ -116,6 +119,7 @@ class NoisyEnvWrapper:
 
         self.n_agents = getattr(env, "n_agents", len(getattr(env, "action_space", [])))
         self._rng = np.random.RandomState()
+        self._malicious_mask = None
 
     def seed(self, seed):
         try:
@@ -126,11 +130,13 @@ class NoisyEnvWrapper:
 
     def reset(self):
         obs, share_obs, available_actions = self.env.reset()
+        self._malicious_mask = None
+        if self.malicious_agent_prob > 0.0 and self.n_agents > 0:
+            self._malicious_mask = (self._rng.rand(self.n_agents) < self.malicious_agent_prob)
         obs = self._apply_obs_noise(obs)
         return obs, share_obs, available_actions
 
     def step(self, actions):
-        actions = self._apply_malicious_actions(actions)
         obs, share_obs, rewards, dones, infos, available_actions = self.env.step(actions)
         obs = self._apply_obs_noise(obs)
         if self.reward_mult != 1.0:
@@ -144,7 +150,7 @@ class NoisyEnvWrapper:
         return getattr(self.env, "render")(*args, **kwargs)
 
     def _apply_obs_noise(self, obs):
-        if self.obs_noise_std <= 0.0 and self.packet_drop_prob <= 0.0:
+        if self.obs_noise_std <= 0.0 and self.packet_drop_prob <= 0.0 and self.malicious_agent_prob <= 0.0:
             return obs
         obs_arr = np.asarray(obs, dtype=np.float32)
         if self.obs_noise_std > 0.0:
@@ -152,28 +158,17 @@ class NoisyEnvWrapper:
         if self.packet_drop_prob > 0.0 and obs_arr.ndim >= 2:
             drop_mask = self._rng.rand(obs_arr.shape[0]) < self.packet_drop_prob
             obs_arr[drop_mask] = 0.0
+        if (
+            self._malicious_mask is not None
+            and self._malicious_mask.any()
+            and obs_arr.ndim >= 2
+            and obs_arr.shape[0] >= self._malicious_mask.shape[0]
+        ):
+            base_std = self.obs_noise_std if self.obs_noise_std > 0.0 else 1.0
+            std = float(max(1e-6, base_std) * max(0.0, self.malicious_obs_noise_scale))
+            mal = self._malicious_mask.astype(bool)
+            obs_arr[mal] = self._rng.normal(0.0, std, size=obs_arr[mal].shape).astype(np.float32)
         return obs_arr
-
-    def _apply_malicious_actions(self, actions):
-        if self.malicious_agent_prob <= 0.0:
-            return actions
-        actions_arr = np.asarray(actions).reshape(-1)
-        actions_int = [int(a) for a in actions_arr]
-        try:
-            avail_actions = np.asarray(self.env.get_avail_actions(), dtype=np.float32)
-        except Exception:
-            avail_actions = None
-        if avail_actions is None:
-            return actions_int
-        for agent_id in range(min(self.n_agents, len(actions_int))):
-            if self._rng.rand() >= self.malicious_agent_prob:
-                continue
-            valid = np.nonzero(avail_actions[agent_id] > 0.5)[0]
-            if valid.size > 0:
-                actions_int[agent_id] = int(self._rng.choice(valid))
-            else:
-                actions_int[agent_id] = 0
-        return actions_int
 
     def __getattr__(self, item):
         return getattr(self.env, item)
@@ -183,14 +178,21 @@ def maybe_wrap_noise(env):
     obs_noise_std = _env_float("ONPOLICY_OBS_NOISE_STD", 0.0)
     packet_drop_prob = _env_float("ONPOLICY_PACKET_DROP_PROB", 0.0)
     malicious_agent_prob = _env_float("ONPOLICY_MALICIOUS_AGENT_PROB", 0.0)
+    malicious_obs_noise_scale = _env_float("ONPOLICY_MALICIOUS_OBS_NOISE_SCALE", 3.0)
     reward_mult = _env_float("ONPOLICY_REWARD_MULT", 1.0)
-    if obs_noise_std <= 0.0 and packet_drop_prob <= 0.0 and malicious_agent_prob <= 0.0 and reward_mult == 1.0:
+    if (
+        obs_noise_std <= 0.0
+        and packet_drop_prob <= 0.0
+        and malicious_agent_prob <= 0.0
+        and reward_mult == 1.0
+    ):
         return env
     return NoisyEnvWrapper(
         env,
         obs_noise_std=obs_noise_std,
         packet_drop_prob=packet_drop_prob,
         malicious_agent_prob=malicious_agent_prob,
+        malicious_obs_noise_scale=malicious_obs_noise_scale,
         reward_mult=reward_mult,
     )
 

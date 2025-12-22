@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from itertools import chain
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -131,6 +131,7 @@ class R_VITAPolicy:
 
         self._neighbor_obs: Optional[np.ndarray] = None
         self._neighbor_masks: Optional[np.ndarray] = None
+        self._neighbor_actions: Optional[np.ndarray] = None
 
         self._vita_comm_delay = int(getattr(args, "vita_comm_delay_updates", 0))
         self._vita_comm_warmup = int(getattr(args, "vita_comm_warmup_updates", 0))
@@ -162,9 +163,15 @@ class R_VITAPolicy:
         trust_gate = _schedule_coeff(trust_elapsed, self._vita_trust_warmup)
         self.agent.set_trust_active(trust_gate > 0.0)
 
-    def set_step_context(self, neighbor_obs: np.ndarray, neighbor_masks: np.ndarray) -> None:
+    def set_step_context(
+        self,
+        neighbor_obs: np.ndarray,
+        neighbor_masks: np.ndarray,
+        neighbor_actions: Optional[np.ndarray] = None,
+    ) -> None:
         self._neighbor_obs = neighbor_obs
         self._neighbor_masks = neighbor_masks
+        self._neighbor_actions = neighbor_actions
 
     def _reshape_obs_seq(self, obs_flat: torch.Tensor) -> torch.Tensor:
         if self.history_length == 1:
@@ -211,6 +218,9 @@ class R_VITAPolicy:
 
         neighbor_obs = check(self._neighbor_obs).to(device=self.device, dtype=torch.float32)
         neighbor_masks = check(self._neighbor_masks).to(device=self.device, dtype=torch.float32)
+        neighbor_actions = None
+        if self._neighbor_actions is not None:
+            neighbor_actions = check(self._neighbor_actions).to(device=self.device, dtype=torch.float32)
 
         if rnn_states_actor.dim() != 3 or rnn_states_actor.size(1) != 1:
             raise ValueError("VITA expects rnn_states_actor to have shape [B, 1, H].")
@@ -226,7 +236,7 @@ class R_VITAPolicy:
             state,
             neighbor_seq,
             neighbor_masks,
-            None,
+            neighbor_actions,
             rnn_states_actor[:, 0],
             rnn_states_critic[:, 0],
             masks,
@@ -263,7 +273,7 @@ class R_VITAPolicy:
         masks,
         available_actions=None,
         active_masks=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
         cent_obs = check(cent_obs).to(device=self.device, dtype=torch.float32)
         obs = check(obs).to(device=self.device, dtype=torch.float32)
         rnn_states_actor = check(rnn_states_actor).to(device=self.device, dtype=torch.float32)
@@ -305,13 +315,23 @@ class R_VITAPolicy:
             values = eval_out["values"]
             kl_loss = eval_out["kl_loss"]
             trust_loss = eval_out["trust_loss"]
+            debug = {
+                "kl_raw": float(eval_out["kl_raw"].item()),
+                "trust_score_mean": float(eval_out["trust_score_mean"].item()),
+                "trust_score_p10": float(eval_out["trust_score_p10"].item()),
+                "trust_score_p50": float(eval_out["trust_score_p50"].item()),
+                "trust_score_p90": float(eval_out["trust_score_p90"].item()),
+                "trust_gate_ratio": float(eval_out["trust_gate_ratio"].item()),
+                "comm_strength": float(eval_out["comm_strength"].item()),
+                "comm_enabled": float(eval_out["comm_enabled"].item()),
+            }
 
             if self._use_policy_active_masks and active_masks is not None:
                 denom = active_masks.sum().clamp_min(1.0)
                 dist_entropy = (entropy * active_masks).sum() / denom
             else:
                 dist_entropy = entropy.mean()
-            return values, log_probs, dist_entropy, kl_loss, trust_loss
+            return values, log_probs, dist_entropy, kl_loss, trust_loss, debug
 
         # Sequence mode (T*N, ...) with initial hidden states (N, ...)
         N = rnn_states_actor.size(0)
@@ -336,6 +356,14 @@ class R_VITAPolicy:
         values_list = []
         kl_list = []
         trust_list = []
+        kl_raw_list = []
+        trust_mean_list = []
+        trust_p10_list = []
+        trust_p50_list = []
+        trust_p90_list = []
+        trust_gate_ratio_list = []
+        comm_strength = None
+        comm_enabled = None
 
         rnn_actor = rnn_states_actor[:, 0]
         rnn_critic = rnn_states_critic[:, 0]
@@ -362,6 +390,15 @@ class R_VITAPolicy:
             values_list.append(eval_out["values"])
             kl_list.append(eval_out["kl_loss"])
             trust_list.append(eval_out["trust_loss"])
+            kl_raw_list.append(eval_out["kl_raw"])
+            trust_mean_list.append(eval_out["trust_score_mean"])
+            trust_p10_list.append(eval_out["trust_score_p10"])
+            trust_p50_list.append(eval_out["trust_score_p50"])
+            trust_p90_list.append(eval_out["trust_score_p90"])
+            trust_gate_ratio_list.append(eval_out["trust_gate_ratio"])
+            if comm_strength is None:
+                comm_strength = eval_out["comm_strength"]
+                comm_enabled = eval_out["comm_enabled"]
             rnn_actor = eval_out["next_actor_state"]
             rnn_critic = eval_out["next_critic_state"]
 
@@ -370,13 +407,29 @@ class R_VITAPolicy:
         values = torch.stack(values_list, dim=0).reshape(T * N, -1)
         kl_loss = torch.stack(kl_list, dim=0).mean()
         trust_loss = torch.stack(trust_list, dim=0).mean()
+        kl_raw = torch.stack(kl_raw_list, dim=0).mean()
+        trust_score_mean = torch.stack(trust_mean_list, dim=0).mean()
+        trust_score_p10 = torch.stack(trust_p10_list, dim=0).mean()
+        trust_score_p50 = torch.stack(trust_p50_list, dim=0).mean()
+        trust_score_p90 = torch.stack(trust_p90_list, dim=0).mean()
+        trust_gate_ratio = torch.stack(trust_gate_ratio_list, dim=0).mean()
+        debug = {
+            "kl_raw": float(kl_raw.item()),
+            "trust_score_mean": float(trust_score_mean.item()),
+            "trust_score_p10": float(trust_score_p10.item()),
+            "trust_score_p50": float(trust_score_p50.item()),
+            "trust_score_p90": float(trust_score_p90.item()),
+            "trust_gate_ratio": float(trust_gate_ratio.item()),
+            "comm_strength": float(comm_strength.item()) if comm_strength is not None else 0.0,
+            "comm_enabled": float(comm_enabled.item()) if comm_enabled is not None else 0.0,
+        }
 
         if self._use_policy_active_masks and active_masks is not None:
             denom = active_masks.reshape(T * N, -1).sum().clamp_min(1.0)
             dist_entropy = (entropy * active_masks.reshape(T * N, -1)).sum() / denom
         else:
             dist_entropy = entropy.mean()
-        return values, log_probs, dist_entropy, kl_loss, trust_loss
+        return values, log_probs, dist_entropy, kl_loss, trust_loss, debug
 
     def act(self, obs, rnn_states_actor, masks, available_actions=None, deterministic: bool = False):
         if self._neighbor_obs is None or self._neighbor_masks is None:
@@ -389,6 +442,9 @@ class R_VITAPolicy:
             available_actions = check(available_actions).to(device=self.device, dtype=torch.float32)
         neighbor_obs = check(self._neighbor_obs).to(device=self.device, dtype=torch.float32)
         neighbor_masks = check(self._neighbor_masks).to(device=self.device, dtype=torch.float32)
+        neighbor_actions = None
+        if self._neighbor_actions is not None:
+            neighbor_actions = check(self._neighbor_actions).to(device=self.device, dtype=torch.float32)
 
         obs_seq = self._reshape_obs_seq(obs)
         neighbor_seq = self._reshape_neighbor_seq(neighbor_obs)
@@ -400,7 +456,7 @@ class R_VITAPolicy:
             dummy_state,
             neighbor_seq,
             neighbor_masks,
-            None,
+            neighbor_actions,
             rnn_states_actor[:, 0],
             dummy_critic[:, 0],
             masks,

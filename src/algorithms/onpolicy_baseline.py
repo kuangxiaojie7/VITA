@@ -182,6 +182,7 @@ def run_onpolicy_smac(cfg: Dict[str, Any], *, config_path: Path, run_dir: Path) 
     os.environ["ONPOLICY_OBS_NOISE_STD"] = str(float(env_cfg.get("obs_noise_std", 0.0)))
     os.environ["ONPOLICY_PACKET_DROP_PROB"] = str(float(env_cfg.get("packet_drop_prob", 0.0)))
     os.environ["ONPOLICY_MALICIOUS_AGENT_PROB"] = str(float(env_cfg.get("malicious_agent_prob", 0.0)))
+    os.environ["ONPOLICY_MALICIOUS_OBS_NOISE_SCALE"] = str(float(env_cfg.get("malicious_obs_noise_scale", 3.0)))
     os.environ["ONPOLICY_REWARD_MULT"] = str(float(env_cfg.get("reward_scale", 1.0)))
 
     args = build_onpolicy_smac_args(cfg, config_path=config_path)

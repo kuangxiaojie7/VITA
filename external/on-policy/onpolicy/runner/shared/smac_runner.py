@@ -1,4 +1,5 @@
 import time
+import os
 import numpy as np
 from functools import reduce
 import torch
@@ -11,12 +12,34 @@ from onpolicy.runner.shared.base_runner import Runner
 def _t2n(x):
     return x.detach().cpu().numpy()
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
 class SMACRunner(Runner):
     """Runner class to perform training, evaluation. and data collection for SMAC. See parent class for details."""
     def __init__(self, config):
         super(SMACRunner, self).__init__(config)
         self._vita_positions = None
         self._vita_alive = None
+        self._vita_comm_rng = None
+        self._vita_comm_noise_std = 0.0
+        self._vita_comm_drop_prob = 0.0
+        self._vita_comm_malicious_prob = 0.0
+        self._vita_comm_malicious_noise_scale = 3.0
+
+        if self.algorithm_name == "rvita":
+            seed = int(getattr(self.all_args, "seed", 0))
+            self._vita_comm_rng = np.random.RandomState(seed)
+            self._vita_comm_noise_std = _env_float("ONPOLICY_COMM_NOISE_STD", 0.0)
+            self._vita_comm_drop_prob = _env_float("ONPOLICY_COMM_PACKET_DROP_PROB", 0.0)
+            self._vita_comm_malicious_prob = _env_float("ONPOLICY_COMM_MALICIOUS_AGENT_PROB", 0.0)
+            self._vita_comm_malicious_noise_scale = _env_float("ONPOLICY_COMM_MALICIOUS_NOISE_SCALE", 3.0)
 
     def run(self):
         self.warmup()   
@@ -101,7 +124,15 @@ class SMACRunner(Runner):
                         "actor_grad_norm",
                         "critic_grad_norm",
                         "kl",
+                        "kl_raw",
                         "trust_loss",
+                        "trust_score_mean",
+                        "trust_score_p10",
+                        "trust_score_p50",
+                        "trust_score_p90",
+                        "trust_gate_ratio",
+                        "comm_strength",
+                        "comm_enabled",
                     }
                 },
                 "entropy": float(train_infos.get("dist_entropy", 0.0)),
@@ -166,9 +197,18 @@ class SMACRunner(Runner):
         if self.algorithm_name == "rvita":
             obs_now = self.buffer.obs[step]
             neighbor_obs, neighbor_masks, neighbor_idx = self._vita_compute_neighbors(obs_now)
+            act_dim = int(self.envs.action_space[0].n)
+            if step > 0:
+                neighbor_prev_actions = self._vita_gather_neighbor_actions(self.buffer.actions[step - 1], neighbor_idx)
+            else:
+                neighbor_prev_actions = np.zeros(
+                    (neighbor_obs.shape[0], neighbor_obs.shape[1], neighbor_obs.shape[2], act_dim),
+                    dtype=np.float32,
+                )
             self.trainer.policy.set_step_context(
                 neighbor_obs.reshape(-1, neighbor_obs.shape[2], neighbor_obs.shape[3]),
                 neighbor_masks.reshape(-1, neighbor_masks.shape[2], 1),
+                neighbor_prev_actions.reshape(-1, neighbor_prev_actions.shape[2], neighbor_prev_actions.shape[3]),
             )
         value, action, action_log_prob, rnn_state, rnn_state_critic \
             = self.trainer.policy.get_actions(np.concatenate(self.buffer.share_obs[step]),
@@ -286,6 +326,33 @@ class SMACRunner(Runner):
 
         neighbor_obs = obs[env_ids, neighbor_idx]
 
+        # Optional communication corruption (independent from env-side observation noise).
+        # - drop: simulates missing neighbor packets/messages.
+        # - malicious: simulates adversarial/garbled neighbor messages (but does not change env dynamics).
+        if self._vita_comm_rng is not None and (self._vita_comm_noise_std > 0.0 or self._vita_comm_drop_prob > 0.0 or self._vita_comm_malicious_prob > 0.0):
+            if self._vita_comm_noise_std > 0.0:
+                neighbor_obs = neighbor_obs + self._vita_comm_rng.normal(
+                    0.0, self._vita_comm_noise_std, size=neighbor_obs.shape
+                ).astype(np.float32)
+
+            if self._vita_comm_drop_prob > 0.0:
+                drop_mask = (self._vita_comm_rng.rand(n_envs, n_agents, max_neighbors) < self._vita_comm_drop_prob)[..., None]
+                drop_mask = drop_mask & (neighbor_masks > 0.5)
+                if drop_mask.any():
+                    neighbor_masks = neighbor_masks * (1.0 - drop_mask.astype(np.float32))
+                    neighbor_obs = neighbor_obs * (1.0 - drop_mask.astype(np.float32))
+
+            if self._vita_comm_malicious_prob > 0.0:
+                mal_mask = (self._vita_comm_rng.rand(n_envs, n_agents, max_neighbors) < self._vita_comm_malicious_prob)[..., None]
+                mal_mask = mal_mask & (neighbor_masks > 0.5)
+                if mal_mask.any():
+                    base_std = self._vita_comm_noise_std if self._vita_comm_noise_std > 0.0 else 1.0
+                    std = float(max(1e-6, base_std) * max(0.0, self._vita_comm_malicious_noise_scale))
+                    neighbor_obs = neighbor_obs + (
+                        self._vita_comm_rng.normal(0.0, std, size=neighbor_obs.shape).astype(np.float32)
+                        * mal_mask.astype(np.float32)
+                    )
+
         return neighbor_obs, neighbor_masks, neighbor_idx
 
     def _vita_gather_neighbor_actions(self, actions, neighbor_idx):
@@ -345,6 +412,7 @@ class SMACRunner(Runner):
 
         eval_positions = None
         eval_alive = None
+        eval_prev_actions = None
         if self.algorithm_name == "rvita":
             eval_positions = np.zeros((self.n_eval_rollout_threads, self.num_agents, 2), dtype=np.float32)
             eval_alive = np.ones((self.n_eval_rollout_threads, self.num_agents), dtype=np.float32)
@@ -361,12 +429,21 @@ class SMACRunner(Runner):
                                             deterministic=True)
             else:
                 if self.algorithm_name == "rvita":
-                    neighbor_obs, neighbor_masks, _ = self._vita_compute_neighbors(
+                    neighbor_obs, neighbor_masks, neighbor_idx = self._vita_compute_neighbors(
                         eval_obs, positions=eval_positions, alive=eval_alive
                     )
+                    act_dim = int(self.eval_envs.action_space[0].n)
+                    if eval_prev_actions is not None:
+                        neighbor_prev_actions = self._vita_gather_neighbor_actions(eval_prev_actions, neighbor_idx)
+                    else:
+                        neighbor_prev_actions = np.zeros(
+                            (neighbor_obs.shape[0], neighbor_obs.shape[1], neighbor_obs.shape[2], act_dim),
+                            dtype=np.float32,
+                        )
                     self.trainer.policy.set_step_context(
                         neighbor_obs.reshape(-1, neighbor_obs.shape[2], neighbor_obs.shape[3]),
                         neighbor_masks.reshape(-1, neighbor_masks.shape[2], 1),
+                        neighbor_prev_actions.reshape(-1, neighbor_prev_actions.shape[2], neighbor_prev_actions.shape[3]),
                     )
                 eval_actions, eval_rnn_states = \
                     self.trainer.policy.act(np.concatenate(eval_obs),
@@ -376,6 +453,7 @@ class SMACRunner(Runner):
                                             deterministic=True)
             eval_actions = np.array(np.split(_t2n(eval_actions), self.n_eval_rollout_threads))
             eval_rnn_states = np.array(np.split(_t2n(eval_rnn_states), self.n_eval_rollout_threads))
+            eval_prev_actions = eval_actions
             
             # Obser reward and next obs
             eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(eval_actions)

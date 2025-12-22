@@ -32,7 +32,7 @@ class VIBGATLayer(nn.Module):
         trust_mask: torch.Tensor,
         comm_mask: torch.Tensor,
         alive_mask: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
         norm_neighbors = self.pre_norm(neighbor_feat)
         mu = self.to_mu(norm_neighbors)
@@ -65,5 +65,6 @@ class VIBGATLayer(nn.Module):
         context = torch.matmul(attn_weights, weighted_values).squeeze(-2)
         comm_feat = self.out_proj(context)
 
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
-        return comm_feat, self.kl_beta * kl
+        kl_raw = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
+        kl_scaled = self.kl_beta * kl_raw
+        return comm_feat, kl_scaled, kl_raw
