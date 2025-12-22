@@ -92,7 +92,17 @@ class SMACRunner(Runner):
                 **{
                     k: float(v) if np.isscalar(v) else v
                     for k, v in train_infos.items()
-                    if k in {"policy_loss", "value_loss", "dist_entropy"}
+                    if k
+                    in {
+                        "policy_loss",
+                        "value_loss",
+                        "dist_entropy",
+                        "ratio",
+                        "actor_grad_norm",
+                        "critic_grad_norm",
+                        "kl",
+                        "trust_loss",
+                    }
                 },
                 "entropy": float(train_infos.get("dist_entropy", 0.0)),
             }
@@ -254,6 +264,10 @@ class SMACRunner(Runner):
 
         positions = np.asarray(positions, dtype=np.float32)
         alive = np.asarray(alive, dtype=np.float32)
+        if alive.ndim == 3 and alive.shape[-1] == 1:
+            alive = alive.squeeze(-1)
+        if alive.ndim == 1:
+            alive = np.broadcast_to(alive[None, :], (n_envs, n_agents))
 
         diff = positions[:, :, None, :] - positions[:, None, :, :]
         dist = np.linalg.norm(diff, axis=-1).astype(np.float32)  # [envs, agents, agents]
@@ -264,12 +278,12 @@ class SMACRunner(Runner):
 
         comm_range = self._vita_comm_range()
         within = dist_k <= (comm_range + 1e-6)
-        neighbor_alive = (np.take_along_axis(alive, neighbor_idx, axis=-1) > 0.5)
+        env_ids = np.arange(n_envs)[:, None, None]
+        neighbor_alive = (alive[env_ids, neighbor_idx] > 0.5)
         self_alive = (alive > 0.5)
         combined = within & neighbor_alive & self_alive[..., None]
         neighbor_masks = combined.astype(np.float32)[..., None]
 
-        env_ids = np.arange(n_envs)[:, None, None]
         neighbor_obs = obs[env_ids, neighbor_idx]
 
         return neighbor_obs, neighbor_masks, neighbor_idx

@@ -106,9 +106,16 @@ def plot_metric(
         else:
             smoothed = moving_average(filtered_values, smooth)
             x_vals = filtered_steps[: len(smoothed)]
-        plt.plot(x_vals, smoothed, linewidth=2, label=f"{run['label']} (window={smooth})")
+        line_color = run.get("color")
+        line = plt.plot(
+            x_vals,
+            smoothed,
+            linewidth=2,
+            label=f"{run['label']} (window={smooth})",
+            color=line_color,
+        )[0]
         if args.winrate_style and not args.no_fill:
-            plt.fill_between(x_vals, smoothed, alpha=args.fill_alpha)
+            plt.fill_between(x_vals, smoothed, alpha=args.fill_alpha, color=line.get_color())
     plt.title(args.title or metric)
     _format_axes(metric, args)
     if not args.winrate_style:
@@ -139,6 +146,16 @@ def main() -> None:
         type=str,
         nargs="*",
         help="Optional labels for each log file. Defaults to filename stem.",
+    )
+    parser.add_argument(
+        "--colors",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional matplotlib colors for each log file (e.g. '#1f77b4', 'tab:orange'). "
+            "Must match the number of --log-files."
+        ),
     )
     parser.add_argument(
         "--metrics",
@@ -192,13 +209,16 @@ def main() -> None:
 
     if args.labels and len(args.labels) != len(args.log_files):
         raise ValueError("Number of labels must match number of log files.")
+    if args.colors and len(args.colors) != len(args.log_files):
+        raise ValueError("Number of colors must match number of log files.")
 
     metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
     runs = []
     for idx, log_path in enumerate(args.log_files):
         entries = load_log(log_path)
         label = args.labels[idx] if args.labels else log_path.stem
-        runs.append({"label": label, "entries": entries})
+        color = args.colors[idx] if args.colors else None
+        runs.append({"label": label, "entries": entries, "color": color})
 
     for metric in metrics:
         plot_metric(metric, runs, max(1, args.smooth), args.output_dir, args)

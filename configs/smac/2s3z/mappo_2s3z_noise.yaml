@@ -7,8 +7,8 @@ env:
   difficulty: "7"
   num_envs: 8
   reward_scale: 1.0
-  obs_noise_std: 0.1
-  packet_drop_prob: 0.1
+  obs_noise_std: 0.15
+  packet_drop_prob: 0.2
   malicious_agent_prob: 0.05
 model:
   hidden_dim: 64
