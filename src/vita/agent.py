@@ -117,11 +117,19 @@ class VITAAgent(torch.nn.Module):
             else:
                 trust_scores = torch.ones_like(comm_mask)
             if use_trust and self.cfg.trust_threshold > 0.0:
-                trust_gate = (trust_scores >= self.cfg.trust_threshold).float()
+                threshold = float(self.cfg.trust_threshold) * float(self.comm_strength)
+                trust_gate = (trust_scores >= threshold).float()
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
-            comm_feat, kl_loss, kl_raw = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask, alive_mask=comm_mask)
+            comm_feat, kl_loss, kl_raw = self.vib_gat(
+                self_feat,
+                neighbor_feat,
+                trust_scores,
+                comm_mask,
+                alive_mask=comm_mask,
+                deterministic=deterministic,
+            )
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
@@ -175,6 +183,8 @@ class VITAAgent(torch.nn.Module):
             trust_score_p50 = torch.zeros(1, device=obs_seq.device)
             trust_score_p90 = torch.zeros(1, device=obs_seq.device)
             trust_gate_ratio = torch.zeros(1, device=obs_seq.device)
+            comm_valid_neighbors = torch.zeros(1, device=obs_seq.device)
+            comm_kept_neighbors = torch.zeros(1, device=obs_seq.device)
         else:
             neighbor_feat = self._encode_neighbors(neighbor_seq)
             if neighbor_mask is None:
@@ -189,21 +199,35 @@ class VITAAgent(torch.nn.Module):
                 pred_actions = neighbor_next_actions
             trust_scores_raw = trust_scores
             if use_trust and self.cfg.trust_threshold > 0.0:
-                trust_gate = (trust_scores >= self.cfg.trust_threshold).float()
+                threshold = float(self.cfg.trust_threshold) * float(self.comm_strength)
+                trust_gate = (trust_scores >= threshold).float()
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
-            comm_feat, kl_loss, kl_raw = self.vib_gat(self_feat, neighbor_feat, trust_scores, comm_mask, alive_mask=comm_mask)
+            comm_feat, kl_loss, kl_raw = self.vib_gat(
+                self_feat,
+                neighbor_feat,
+                trust_scores,
+                comm_mask,
+                alive_mask=comm_mask,
+                deterministic=False,
+            )
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
             if use_trust:
-                trust_loss = F.mse_loss(pred_actions * comm_mask, neighbor_next_actions * comm_mask)
+                has_label = neighbor_next_actions.sum(dim=-1, keepdim=True) > 1e-6
+                valid = (neighbor_mask > 0.5) & has_label
+                valid = valid.float()
+                se = (pred_actions - neighbor_next_actions).pow(2).sum(dim=-1, keepdim=True)
+                trust_loss = (se * valid).sum() / valid.sum().clamp_min(1.0)
             else:
                 trust_loss = torch.zeros(1, device=obs_seq.device)
 
             # Trust diagnostics (computed on valid neighbor slots before comm dropout).
             valid_mask = (neighbor_mask > 0.5).squeeze(-1)
+            comm_valid_neighbors = valid_mask.float().sum(dim=-1).mean()
+            comm_kept_neighbors = (comm_mask > 0.5).squeeze(-1).float().sum(dim=-1).mean()
             trust_values = trust_scores_raw.squeeze(-1)[valid_mask]
             if trust_values.numel() == 0:
                 trust_score_mean = torch.zeros(1, device=obs_seq.device)
@@ -242,6 +266,8 @@ class VITAAgent(torch.nn.Module):
             "trust_score_p50": trust_score_p50,
             "trust_score_p90": trust_score_p90,
             "trust_gate_ratio": trust_gate_ratio,
+            "comm_valid_neighbors": comm_valid_neighbors,
+            "comm_kept_neighbors": comm_kept_neighbors,
             "comm_strength": torch.tensor(float(self.comm_strength), device=obs_seq.device),
             "comm_enabled": torch.tensor(float(self.comm_enabled), device=obs_seq.device),
             "next_actor_state": next_actor.squeeze(0),

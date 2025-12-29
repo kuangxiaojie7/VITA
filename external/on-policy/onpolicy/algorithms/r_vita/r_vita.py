@@ -220,6 +220,8 @@ class R_VITA:
             "trust_score_p50": 0.0,
             "trust_score_p90": 0.0,
             "trust_gate_ratio": 0.0,
+            "comm_valid_neighbors": 0.0,
+            "comm_kept_neighbors": 0.0,
             "comm_strength": 0.0,
             "comm_enabled": 0.0,
         }
@@ -259,6 +261,8 @@ class R_VITA:
                 train_info["trust_score_p50"] += float(debug.get("trust_score_p50", 0.0))
                 train_info["trust_score_p90"] += float(debug.get("trust_score_p90", 0.0))
                 train_info["trust_gate_ratio"] += float(debug.get("trust_gate_ratio", 0.0))
+                train_info["comm_valid_neighbors"] += float(debug.get("comm_valid_neighbors", 0.0))
+                train_info["comm_kept_neighbors"] += float(debug.get("comm_kept_neighbors", 0.0))
                 train_info["comm_strength"] += float(debug.get("comm_strength", 0.0))
                 train_info["comm_enabled"] += float(debug.get("comm_enabled", 0.0))
 

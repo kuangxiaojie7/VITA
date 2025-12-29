@@ -11,30 +11,30 @@ env:
   packet_drop_prob: 0.0
   malicious_agent_prob: 0.0
 model:
-  hidden_dim: 192
-  latent_dim: 96
+  hidden_dim: 128
+  latent_dim: 64
   trust_gamma: 1.0
-  kl_beta: 0.0005
+  kl_beta: 0.001
   attn_bias_coef: 0.75
   trust_lambda: 0.12
-  trust_threshold: 0.3
+  trust_threshold: 0.2
   comm_dropout: 0.1
   enable_trust: true
-  enable_kl: false
-  comm_sight_range: 5
+  enable_kl: true
+  comm_sight_range: 0
   max_neighbors: 4
   history_length: 4
 train:
-  episode_length: 120
-  updates: 1000
-  lr: 0.0002
+  episode_length: 400
+  updates: 3125
+  lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
   clip_param: 0.2
   ppo_epochs: 5
-  num_mini_batch: 4
-  entropy_coef: 0.008
-  value_loss_coef: 0.7
+  num_mini_batch: 1
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
   max_grad_norm: 10.0
   trust_warmup_updates: 100
   kl_warmup_updates: 0

@@ -91,6 +91,7 @@ class NoisyEnvWrapper:
       - ONPOLICY_PACKET_DROP_PROB
       - ONPOLICY_MALICIOUS_AGENT_PROB
       - ONPOLICY_MALICIOUS_OBS_NOISE_SCALE
+      - ONPOLICY_NOISE_WARMUP_STEPS
       - ONPOLICY_REWARD_MULT
 
     Defaults are no-op (0/1), so the clean "official baseline" remains unchanged.
@@ -104,6 +105,8 @@ class NoisyEnvWrapper:
         packet_drop_prob: float = 0.0,
         malicious_agent_prob: float = 0.0,
         malicious_obs_noise_scale: float = 3.0,
+        noise_warmup_steps: int = 0,
+        start_at_full_noise: bool = False,
         reward_mult: float = 1.0,
     ):
         self.env = env
@@ -111,6 +114,7 @@ class NoisyEnvWrapper:
         self.packet_drop_prob = float(packet_drop_prob)
         self.malicious_agent_prob = float(malicious_agent_prob)
         self.malicious_obs_noise_scale = float(malicious_obs_noise_scale)
+        self.noise_warmup_steps = int(max(0, noise_warmup_steps))
         self.reward_mult = float(reward_mult)
 
         self.observation_space = env.observation_space
@@ -120,6 +124,13 @@ class NoisyEnvWrapper:
         self.n_agents = getattr(env, "n_agents", len(getattr(env, "action_space", [])))
         self._rng = np.random.RandomState()
         self._malicious_mask = None
+        self._noise_step = int(self.noise_warmup_steps) if start_at_full_noise else 0
+
+    def _noise_coeff(self) -> float:
+        warmup = int(self.noise_warmup_steps)
+        if warmup <= 0:
+            return 1.0
+        return float(min(1.0, self._noise_step / float(warmup)))
 
     def seed(self, seed):
         try:
@@ -131,13 +142,16 @@ class NoisyEnvWrapper:
     def reset(self):
         obs, share_obs, available_actions = self.env.reset()
         self._malicious_mask = None
-        if self.malicious_agent_prob > 0.0 and self.n_agents > 0:
-            self._malicious_mask = (self._rng.rand(self.n_agents) < self.malicious_agent_prob)
+        coeff = self._noise_coeff()
+        eff_mal_prob = float(max(0.0, self.malicious_agent_prob) * coeff)
+        if eff_mal_prob > 0.0 and self.n_agents > 0:
+            self._malicious_mask = (self._rng.rand(self.n_agents) < eff_mal_prob)
         obs = self._apply_obs_noise(obs)
         return obs, share_obs, available_actions
 
     def step(self, actions):
         obs, share_obs, rewards, dones, infos, available_actions = self.env.step(actions)
+        self._noise_step += 1
         obs = self._apply_obs_noise(obs)
         if self.reward_mult != 1.0:
             rewards = (np.asarray(rewards, dtype=np.float32) * self.reward_mult).tolist()
@@ -152,11 +166,21 @@ class NoisyEnvWrapper:
     def _apply_obs_noise(self, obs):
         if self.obs_noise_std <= 0.0 and self.packet_drop_prob <= 0.0 and self.malicious_agent_prob <= 0.0:
             return obs
+        coeff = self._noise_coeff()
+        obs_noise_std = float(max(0.0, self.obs_noise_std) * coeff)
+        packet_drop_prob = float(max(0.0, self.packet_drop_prob) * coeff)
+        malicious_obs_noise_scale = float(max(0.0, self.malicious_obs_noise_scale) * coeff)
+        if (
+            obs_noise_std <= 0.0
+            and packet_drop_prob <= 0.0
+            and (self._malicious_mask is None or not self._malicious_mask.any() or malicious_obs_noise_scale <= 0.0)
+        ):
+            return obs
         obs_arr = np.asarray(obs, dtype=np.float32)
-        if self.obs_noise_std > 0.0:
-            obs_arr = obs_arr + self._rng.normal(0.0, self.obs_noise_std, size=obs_arr.shape).astype(np.float32)
-        if self.packet_drop_prob > 0.0 and obs_arr.ndim >= 2:
-            drop_mask = self._rng.rand(obs_arr.shape[0]) < self.packet_drop_prob
+        if obs_noise_std > 0.0:
+            obs_arr = obs_arr + self._rng.normal(0.0, obs_noise_std, size=obs_arr.shape).astype(np.float32)
+        if packet_drop_prob > 0.0 and obs_arr.ndim >= 2:
+            drop_mask = self._rng.rand(obs_arr.shape[0]) < packet_drop_prob
             obs_arr[drop_mask] = 0.0
         if (
             self._malicious_mask is not None
@@ -164,8 +188,8 @@ class NoisyEnvWrapper:
             and obs_arr.ndim >= 2
             and obs_arr.shape[0] >= self._malicious_mask.shape[0]
         ):
-            base_std = self.obs_noise_std if self.obs_noise_std > 0.0 else 1.0
-            std = float(max(1e-6, base_std) * max(0.0, self.malicious_obs_noise_scale))
+            base_std = obs_noise_std if obs_noise_std > 0.0 else 1.0
+            std = float(max(1e-6, base_std) * malicious_obs_noise_scale)
             mal = self._malicious_mask.astype(bool)
             obs_arr[mal] = self._rng.normal(0.0, std, size=obs_arr[mal].shape).astype(np.float32)
         return obs_arr
@@ -174,16 +198,18 @@ class NoisyEnvWrapper:
         return getattr(self.env, item)
 
 
-def maybe_wrap_noise(env):
+def maybe_wrap_noise(env, *, start_at_full_noise: bool = False):
     obs_noise_std = _env_float("ONPOLICY_OBS_NOISE_STD", 0.0)
     packet_drop_prob = _env_float("ONPOLICY_PACKET_DROP_PROB", 0.0)
     malicious_agent_prob = _env_float("ONPOLICY_MALICIOUS_AGENT_PROB", 0.0)
     malicious_obs_noise_scale = _env_float("ONPOLICY_MALICIOUS_OBS_NOISE_SCALE", 3.0)
+    noise_warmup_steps = int(_env_float("ONPOLICY_NOISE_WARMUP_STEPS", 0.0))
     reward_mult = _env_float("ONPOLICY_REWARD_MULT", 1.0)
     if (
         obs_noise_std <= 0.0
         and packet_drop_prob <= 0.0
         and malicious_agent_prob <= 0.0
+        and noise_warmup_steps <= 0
         and reward_mult == 1.0
     ):
         return env
@@ -193,6 +219,8 @@ def maybe_wrap_noise(env):
         packet_drop_prob=packet_drop_prob,
         malicious_agent_prob=malicious_agent_prob,
         malicious_obs_noise_scale=malicious_obs_noise_scale,
+        noise_warmup_steps=noise_warmup_steps,
+        start_at_full_noise=start_at_full_noise,
         reward_mult=reward_mult,
     )
 
@@ -277,7 +305,7 @@ def make_eval_env(all_args):
                 env = StarCraft2Env(all_args)
                 offset = int(getattr(all_args, "n_rollout_threads", 1))
                 env._sc2_port = all_args._sc2_port_base + (offset + rank) * all_args._sc2_port_step
-                env = maybe_wrap_noise(env)
+                env = maybe_wrap_noise(env, start_at_full_noise=True)
             elif all_args.env_name == "StarCraft2v2":
                 from onpolicy.envs.starcraft2.SMACv2_modified import SMACv2
                 env = SMACv2(capability_config=parse_smacv2_distribution(all_args), map_name=all_args.map_name)

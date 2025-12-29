@@ -19,6 +19,26 @@ def _t2n(x):
     """Convert torch tensor to a numpy array."""
     return x.detach().cpu().numpy()
 
+def _jsonify(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(v) for v in value]
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.item()
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            return value.item()
+        return value.tolist()
+    return str(value)
+
 class Runner(object):
     """
     Base class for training recurrent policies.
@@ -130,7 +150,7 @@ class Runner(object):
         payload = {"time": time.time(), **metrics}
         if step is not None:
             payload["step"] = int(step)
-        self._json_log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._json_log_file.write(json.dumps(_jsonify(payload), ensure_ascii=False) + "\n")
         self._json_log_file.flush()
 
     def close_json(self) -> None:

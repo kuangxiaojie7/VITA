@@ -38,9 +38,9 @@ train:
   max_grad_norm: 10.0
   trust_warmup_updates: 60
   kl_warmup_updates: 50
-  trust_delay_updates: 20
-  kl_delay_updates: 0
-  comm_delay_updates: 20
+  trust_delay_updates: 60
+  kl_delay_updates: 60
+  comm_delay_updates: 60
   comm_warmup_updates: 80
   comm_full_warmup_updates: 120
   eval_interval_updates: 20

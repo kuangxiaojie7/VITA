@@ -32,14 +32,19 @@ class VIBGATLayer(nn.Module):
         trust_mask: torch.Tensor,
         comm_mask: torch.Tensor,
         alive_mask: torch.Tensor | None = None,
+        *,
+        deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
         norm_neighbors = self.pre_norm(neighbor_feat)
         mu = self.to_mu(norm_neighbors)
         logvar = self.to_logvar(norm_neighbors)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
+        if deterministic:
+            z = mu
+        else:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
         z = self.post_norm(z)
 
         query = self.query_proj(self_feat).unsqueeze(1)
@@ -65,6 +70,9 @@ class VIBGATLayer(nn.Module):
         context = torch.matmul(attn_weights, weighted_values).squeeze(-2)
         comm_feat = self.out_proj(context)
 
-        kl_raw = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
+        kl_per_edge = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        edge_mask = comm_mask.squeeze(-1)
+        denom = edge_mask.sum().clamp_min(1.0)
+        kl_raw = (kl_per_edge * edge_mask).sum() / denom
         kl_scaled = self.kl_beta * kl_raw
         return comm_feat, kl_scaled, kl_raw

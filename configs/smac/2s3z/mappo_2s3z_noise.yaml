@@ -8,9 +8,14 @@ env:
   num_envs: 8
   reward_scale: 1.0
   obs_noise_std: 0.0
+  noise_warmup_steps: 0
   packet_drop_prob: 0.0
-  malicious_agent_prob: 0.2
-  malicious_obs_noise_scale: 1.0
+  malicious_agent_prob: 0.0
+  malicious_obs_noise_scale: 0.5
+  comm_noise_std: 0.0
+  comm_packet_drop_prob: 0.0
+  comm_malicious_agent_prob: 0.0
+  comm_malicious_noise_scale: 0.5
 model:
   hidden_dim: 64
 train:

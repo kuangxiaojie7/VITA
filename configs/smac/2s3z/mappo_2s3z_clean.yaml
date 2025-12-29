@@ -5,22 +5,22 @@ env:
   name: smac
   map_name: "2s3z"
   difficulty: "7"
-  num_envs: 8            # 8 envs * 400 steps = 3200 env-steps/update
+  num_envs: 8            
   reward_scale: 1.0
   obs_noise_std: 0.0
   packet_drop_prob: 0.0
   malicious_agent_prob: 0.0
 model:
-  hidden_dim: 64         # SMAC 2s3z: lighter net suffices
+  hidden_dim: 64         
 train:
-  episode_length: 400    # paper SMAC "buffer length" (rollout horizon per update)
+  episode_length: 400    
   updates: 1500          
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
   clip_param: 0.2
-  ppo_epochs: 15         # simple map: more epochs per batch
-  num_mini_batch: 1      # use full batch
+  ppo_epochs: 15         
+  num_mini_batch: 1      
   entropy_coef: 0.01
   value_loss_coef: 0.5
   max_grad_norm: 10.0

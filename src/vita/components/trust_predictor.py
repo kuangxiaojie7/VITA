@@ -29,13 +29,16 @@ class TrustPredictor(nn.Module):
             neighbor_feat: [B, K, hidden_dim]
             neighbor_next_action: optional [B, K, action_dim] one-hot labels
         Returns:
-            pred_actions: predicted logits [B, K, action_dim]
+            pred_actions: predicted action probabilities [B, K, action_dim]
             trust_mask: [B, K, 1] trust scores in [0, 1]
         """
         logits = self.net(neighbor_feat)
+        probs = torch.softmax(logits, dim=-1)
         if neighbor_next_action is None:
             trust = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
         else:
-            mse = F.mse_loss(logits, neighbor_next_action, reduction="none").mean(dim=-1, keepdim=True)
-            trust = torch.exp(-self.gamma * mse)
-        return logits, trust
+            has_label = neighbor_next_action.sum(dim=-1, keepdim=True) > 1e-6
+            p_true = (probs * neighbor_next_action).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            trust_raw = p_true.pow(self.gamma)
+            trust = torch.where(has_label, trust_raw, torch.ones_like(trust_raw))
+        return probs, trust
