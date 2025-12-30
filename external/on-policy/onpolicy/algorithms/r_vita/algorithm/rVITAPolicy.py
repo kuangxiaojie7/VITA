@@ -161,7 +161,7 @@ class R_VITAPolicy:
 
         trust_elapsed = update - self._vita_trust_delay
         trust_gate = _schedule_coeff(trust_elapsed, self._vita_trust_warmup)
-        self.agent.set_trust_active(trust_gate > 0.0)
+        self.agent.set_trust_strength(trust_gate)
 
     def set_step_context(
         self,

@@ -35,7 +35,7 @@ class VITAAgent(torch.nn.Module):
         self.actor_encoder = FeatureEncoder(cfg.obs_dim, cfg.hidden_dim)
         self.critic_encoder = FeatureEncoder(cfg.state_dim, cfg.hidden_dim)
         self.comm_encoder = FeatureEncoder(cfg.obs_dim, cfg.hidden_dim)
-        self.trust_predictor = TrustPredictor(cfg.hidden_dim, cfg.action_dim, cfg.trust_gamma)
+        self.trust_predictor = TrustPredictor(cfg.hidden_dim, cfg.trust_gamma)
         self.vib_gat = VIBGATLayer(cfg.hidden_dim, cfg.latent_dim, cfg.kl_beta, cfg.attn_bias_coef)
         self.residual = GatedResidualBlock(cfg.hidden_dim)
         self.neighbor_norm = torch.nn.LayerNorm(cfg.hidden_dim)
@@ -52,7 +52,7 @@ class VITAAgent(torch.nn.Module):
         self.value_head = torch.nn.Linear(cfg.hidden_dim, 1)
         self.comm_enabled = True
         self.comm_strength = 0.0
-        self.trust_active = False
+        self.trust_strength = 0.0
 
     def set_comm_enabled(self, enabled: bool) -> None:
         self.comm_enabled = enabled
@@ -63,8 +63,15 @@ class VITAAgent(torch.nn.Module):
         strength = float(max(0.0, min(1.0, strength)))
         self.comm_strength = strength
 
+    def set_trust_strength(self, strength: float) -> None:
+        if not self.cfg.enable_trust:
+            self.trust_strength = 0.0
+            return
+        strength = float(max(0.0, min(1.0, strength)))
+        self.trust_strength = strength
+
     def set_trust_active(self, active: bool) -> None:
-        self.trust_active = bool(active and self.cfg.enable_trust)
+        self.set_trust_strength(1.0 if active else 0.0)
 
     @property
     def rnn_hidden_dim(self) -> int:
@@ -110,15 +117,17 @@ class VITAAgent(torch.nn.Module):
             if neighbor_mask is None:
                 neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
             comm_mask = neighbor_mask.float()
-            use_trust = self.cfg.enable_trust and self.trust_active
+            use_trust = self.cfg.enable_trust and (self.trust_strength > 0.0)
             if use_trust:
-                _, trust_scores = self.trust_predictor(neighbor_feat, neighbor_next_actions)
-                trust_scores = trust_scores.detach()
+                trust_scores_raw = self.trust_predictor(self_feat, neighbor_feat)
+                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores_raw
             else:
+                trust_scores_raw = None
                 trust_scores = torch.ones_like(comm_mask)
             if use_trust and self.cfg.trust_threshold > 0.0:
                 threshold = float(self.cfg.trust_threshold) * float(self.comm_strength)
-                trust_gate = (trust_scores >= threshold).float()
+                trust_gate_hard = (trust_scores >= threshold).float()
+                trust_gate = trust_gate_hard + trust_scores - trust_scores.detach()
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
@@ -190,17 +199,17 @@ class VITAAgent(torch.nn.Module):
             if neighbor_mask is None:
                 neighbor_mask = torch.ones(neighbor_feat.size(0), neighbor_feat.size(1), 1, device=neighbor_feat.device)
             comm_mask = neighbor_mask.float()
-            use_trust = self.cfg.enable_trust and self.trust_active
+            use_trust = self.cfg.enable_trust and (self.trust_strength > 0.0)
             if use_trust:
-                pred_actions, trust_scores = self.trust_predictor(neighbor_feat, neighbor_next_actions)
-                trust_scores = trust_scores.detach()
+                trust_scores_raw = self.trust_predictor(self_feat, neighbor_feat)
+                trust_scores = (1.0 - float(self.trust_strength)) + float(self.trust_strength) * trust_scores_raw
             else:
                 trust_scores = torch.ones_like(comm_mask)
-                pred_actions = neighbor_next_actions
-            trust_scores_raw = trust_scores
+                trust_scores_raw = None
             if use_trust and self.cfg.trust_threshold > 0.0:
                 threshold = float(self.cfg.trust_threshold) * float(self.comm_strength)
-                trust_gate = (trust_scores >= threshold).float()
+                trust_gate_hard = (trust_scores >= threshold).float()
+                trust_gate = trust_gate_hard + trust_scores - trust_scores.detach()
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
@@ -216,11 +225,9 @@ class VITAAgent(torch.nn.Module):
                 kl_loss = torch.zeros(1, device=self_feat.device)
             comm_feat = self.comm_dropout(comm_feat)
             if use_trust:
-                has_label = neighbor_next_actions.sum(dim=-1, keepdim=True) > 1e-6
-                valid = (neighbor_mask > 0.5) & has_label
-                valid = valid.float()
-                se = (pred_actions - neighbor_next_actions).pow(2).sum(dim=-1, keepdim=True)
-                trust_loss = (se * valid).sum() / valid.sum().clamp_min(1.0)
+                valid = (neighbor_mask > 0.5).float()
+                denom = valid.sum().clamp_min(1.0)
+                trust_loss = (trust_scores_raw * valid).sum() / denom
             else:
                 trust_loss = torch.zeros(1, device=obs_seq.device)
 
@@ -228,7 +235,7 @@ class VITAAgent(torch.nn.Module):
             valid_mask = (neighbor_mask > 0.5).squeeze(-1)
             comm_valid_neighbors = valid_mask.float().sum(dim=-1).mean()
             comm_kept_neighbors = (comm_mask > 0.5).squeeze(-1).float().sum(dim=-1).mean()
-            trust_values = trust_scores_raw.squeeze(-1)[valid_mask]
+            trust_values = (trust_scores_raw if trust_scores_raw is not None else trust_scores).squeeze(-1)[valid_mask]
             if trust_values.numel() == 0:
                 trust_score_mean = torch.zeros(1, device=obs_seq.device)
                 trust_score_p10 = torch.zeros(1, device=obs_seq.device)
