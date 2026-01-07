@@ -277,6 +277,8 @@ def get_config():
     parser.add_argument("--vita_comm_dropout", type=float, default=0.1)
     parser.add_argument("--vita_attn_bias_coef", type=float, default=1.0)
     parser.add_argument("--vita_trust_threshold", type=float, default=0.0)
+    parser.add_argument("--vita_trust_keep_ratio", type=float, default=1.0,
+                        help="Quantile-based trust pruning: keep this fraction (0,1] of trusted neighbors after applying min trust threshold.")
     parser.add_argument("--vita_comm_sight_range", type=float, default=0.0,
                         help="If >0, override per-agent sight range for communication.")
     parser.add_argument("--vita_max_neighbors", type=int, default=4)

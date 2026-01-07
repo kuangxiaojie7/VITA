@@ -91,6 +91,7 @@ class R_VITAPolicy:
             enable_trust=not bool(getattr(args, "vita_disable_trust", False)),
             enable_kl=not bool(getattr(args, "vita_disable_kl", False)),
             trust_threshold=float(getattr(args, "vita_trust_threshold", 0.0)),
+            trust_keep_ratio=float(getattr(args, "vita_trust_keep_ratio", 1.0)),
             attn_bias_coef=float(getattr(args, "vita_attn_bias_coef", 1.0)),
         )
 

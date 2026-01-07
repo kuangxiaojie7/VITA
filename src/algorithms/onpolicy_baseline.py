@@ -120,6 +120,7 @@ def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[
         args += ["--vita_attn_bias_coef", str(_as_float(model_cfg.get("attn_bias_coef", 1.0), name="model.attn_bias_coef"))]
         args += ["--vita_trust_lambda", str(_as_float(model_cfg.get("trust_lambda", 0.1), name="model.trust_lambda"))]
         args += ["--vita_trust_threshold", str(_as_float(model_cfg.get("trust_threshold", 0.0), name="model.trust_threshold"))]
+        args += ["--vita_trust_keep_ratio", str(_as_float(model_cfg.get("trust_keep_ratio", 1.0), name="model.trust_keep_ratio"))]
         args += ["--vita_comm_dropout", str(_as_float(model_cfg.get("comm_dropout", 0.1), name="model.comm_dropout"))]
         args += ["--vita_comm_sight_range", str(_as_float(model_cfg.get("comm_sight_range", 0.0), name="model.comm_sight_range"))]
         args += ["--vita_max_neighbors", str(_as_int(model_cfg.get("max_neighbors", 4), name="model.max_neighbors"))]

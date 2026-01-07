@@ -1,5 +1,5 @@
 algorithm: vita
-seed: 42
+seed: 1
 cuda: true
 env:
   name: smac
@@ -13,11 +13,12 @@ env:
 model:
   hidden_dim: 128
   latent_dim: 64
-  trust_gamma: 1.0
-  kl_beta: 0.0005
+  trust_gamma: 10.0
+  kl_beta: 0.0001
   attn_bias_coef: 0.75
   trust_lambda: 0.08
   trust_threshold: 0.25
+  trust_keep_ratio: 1.0
   comm_dropout: 0.1
   enable_trust: true
   enable_kl: true
@@ -35,13 +36,14 @@ train:
   num_mini_batch: 1
   entropy_coef: 0.01
   value_loss_coef: 0.5
+  use_value_active_masks: false
   max_grad_norm: 10.0
-  trust_warmup_updates: 80
-  kl_warmup_updates: 50
-  trust_delay_updates: 160
+  trust_warmup_updates: 500
+  kl_warmup_updates: 500
+  trust_delay_updates: 280
   kl_delay_updates: 0
   comm_delay_updates: 80
   comm_warmup_updates: 80
   comm_full_warmup_updates: 120
-  eval_interval_updates: 20
+  eval_interval_updates: 25
   eval_episodes: 32

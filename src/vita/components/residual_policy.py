@@ -11,7 +11,7 @@ class GatedResidualBlock(nn.Module):
         super().__init__()
         self.gate = nn.Linear(hidden_dim * 2, hidden_dim)
         nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, -10.0)
+        nn.init.constant_(self.gate.bias, -5.0)
 
     def forward(
         self,
