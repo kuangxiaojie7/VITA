@@ -24,6 +24,7 @@ class VITAAgentConfig:
     comm_dropout: float = 0.1
     enable_trust: bool = True
     enable_kl: bool = True
+    vib_deterministic: bool = False
     trust_threshold: float = 0.0
     trust_keep_ratio: float = 1.0
     attn_bias_coef: float = 1.0
@@ -162,13 +163,14 @@ class VITAAgent(torch.nn.Module):
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            vib_deterministic = bool(deterministic) or bool(self.cfg.vib_deterministic)
             comm_feat, kl_loss, kl_raw = self.vib_gat(
                 self_feat,
                 neighbor_feat,
                 trust_scores,
                 comm_mask,
                 alive_mask=comm_mask,
-                deterministic=deterministic,
+                deterministic=vib_deterministic,
             )
             if not self.cfg.enable_kl:
                 kl_loss = torch.zeros(1, device=self_feat.device)
@@ -276,13 +278,14 @@ class VITAAgent(torch.nn.Module):
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
+            vib_deterministic = bool(self.cfg.vib_deterministic)
             comm_feat, kl_loss, kl_raw = self.vib_gat(
                 self_feat,
                 neighbor_feat,
                 trust_scores,
                 comm_mask,
                 alive_mask=comm_mask,
-                deterministic=False,
+                deterministic=vib_deterministic,
             )
             # Align KL penalty strength with how much communication is used in the residual fusion.
             kl_loss = kl_loss * float(self.comm_strength)
@@ -318,6 +321,21 @@ class VITAAgent(torch.nn.Module):
                 kept = (comm_mask > 0.5).squeeze(-1)[valid_mask].float().sum()
                 trust_gate_ratio = kept / valid_mask.float().sum().clamp_min(1.0)
         fused = self.residual(self_feat, comm_feat, self.comm_enabled, self.comm_strength)
+        if (not self.comm_enabled) or (self.comm_strength <= 0.0):
+            residual_gate_mean = torch.zeros(1, device=obs_seq.device)
+            residual_gate_max = torch.zeros(1, device=obs_seq.device)
+            residual_comm_ratio = torch.zeros(1, device=obs_seq.device)
+        else:
+            with torch.no_grad():
+                strength = float(max(0.0, min(1.0, float(self.comm_strength))))
+                strength_t = torch.as_tensor(strength, device=self_feat.device, dtype=self_feat.dtype)
+                gate_input = torch.cat([self_feat, comm_feat], dim=-1)
+                gate = torch.sigmoid(self.residual.gate(gate_input)) * strength_t
+                residual_gate_mean = gate.mean()
+                residual_gate_max = gate.max()
+                comm_contrib = (gate * comm_feat).norm(dim=-1)
+                self_norm = self_feat.norm(dim=-1).clamp_min(1e-6)
+                residual_comm_ratio = (comm_contrib / self_norm).mean()
         logits = self.policy_head(fused)
         logits = self._mask_logits(logits, avail_actions)
         dist = Categorical(logits=logits)
@@ -343,6 +361,9 @@ class VITAAgent(torch.nn.Module):
             "comm_kept_neighbors": comm_kept_neighbors,
             "comm_strength": torch.tensor(float(self.comm_strength), device=obs_seq.device),
             "comm_enabled": torch.tensor(float(self.comm_enabled), device=obs_seq.device),
+            "residual_gate_mean": residual_gate_mean,
+            "residual_gate_max": residual_gate_max,
+            "residual_comm_ratio": residual_comm_ratio,
             "next_actor_state": next_actor.squeeze(0),
             "next_critic_state": next_critic.squeeze(0),
         }

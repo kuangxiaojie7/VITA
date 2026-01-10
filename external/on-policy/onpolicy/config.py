@@ -282,6 +282,8 @@ def get_config():
     parser.add_argument("--vita_comm_sight_range", type=float, default=0.0,
                         help="If >0, override per-agent sight range for communication.")
     parser.add_argument("--vita_max_neighbors", type=int, default=4)
+    parser.add_argument("--vita_vib_deterministic", action="store_true", default=False,
+                        help="Disable VIB variational sampling (use mean only).")
     parser.add_argument("--vita_disable_trust", action="store_true", default=False)
     parser.add_argument("--vita_disable_kl", action="store_true", default=False)
 

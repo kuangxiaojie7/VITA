@@ -90,6 +90,7 @@ class R_VITAPolicy:
             comm_dropout=float(getattr(args, "vita_comm_dropout", 0.1)),
             enable_trust=not bool(getattr(args, "vita_disable_trust", False)),
             enable_kl=not bool(getattr(args, "vita_disable_kl", False)),
+            vib_deterministic=bool(getattr(args, "vita_vib_deterministic", False)),
             trust_threshold=float(getattr(args, "vita_trust_threshold", 0.0)),
             trust_keep_ratio=float(getattr(args, "vita_trust_keep_ratio", 1.0)),
             attn_bias_coef=float(getattr(args, "vita_attn_bias_coef", 1.0)),
@@ -323,8 +324,13 @@ class R_VITAPolicy:
                 "trust_score_p50": float(eval_out["trust_score_p50"].item()),
                 "trust_score_p90": float(eval_out["trust_score_p90"].item()),
                 "trust_gate_ratio": float(eval_out["trust_gate_ratio"].item()),
+                "comm_valid_neighbors": float(eval_out["comm_valid_neighbors"].item()),
+                "comm_kept_neighbors": float(eval_out["comm_kept_neighbors"].item()),
                 "comm_strength": float(eval_out["comm_strength"].item()),
                 "comm_enabled": float(eval_out["comm_enabled"].item()),
+                "residual_gate_mean": float(eval_out["residual_gate_mean"].item()),
+                "residual_gate_max": float(eval_out["residual_gate_max"].item()),
+                "residual_comm_ratio": float(eval_out["residual_comm_ratio"].item()),
             }
 
             if self._use_policy_active_masks and active_masks is not None:
@@ -363,6 +369,11 @@ class R_VITAPolicy:
         trust_p50_list = []
         trust_p90_list = []
         trust_gate_ratio_list = []
+        comm_valid_neighbors_list = []
+        comm_kept_neighbors_list = []
+        residual_gate_mean_list = []
+        residual_gate_max_list = []
+        residual_comm_ratio_list = []
         comm_strength = None
         comm_enabled = None
 
@@ -397,6 +408,11 @@ class R_VITAPolicy:
             trust_p50_list.append(eval_out["trust_score_p50"])
             trust_p90_list.append(eval_out["trust_score_p90"])
             trust_gate_ratio_list.append(eval_out["trust_gate_ratio"])
+            comm_valid_neighbors_list.append(eval_out["comm_valid_neighbors"])
+            comm_kept_neighbors_list.append(eval_out["comm_kept_neighbors"])
+            residual_gate_mean_list.append(eval_out["residual_gate_mean"])
+            residual_gate_max_list.append(eval_out["residual_gate_max"])
+            residual_comm_ratio_list.append(eval_out["residual_comm_ratio"])
             if comm_strength is None:
                 comm_strength = eval_out["comm_strength"]
                 comm_enabled = eval_out["comm_enabled"]
@@ -414,6 +430,11 @@ class R_VITAPolicy:
         trust_score_p50 = torch.stack(trust_p50_list, dim=0).mean()
         trust_score_p90 = torch.stack(trust_p90_list, dim=0).mean()
         trust_gate_ratio = torch.stack(trust_gate_ratio_list, dim=0).mean()
+        comm_valid_neighbors = torch.stack(comm_valid_neighbors_list, dim=0).mean() if comm_valid_neighbors_list else torch.zeros(1, device=self.device)
+        comm_kept_neighbors = torch.stack(comm_kept_neighbors_list, dim=0).mean() if comm_kept_neighbors_list else torch.zeros(1, device=self.device)
+        residual_gate_mean = torch.stack(residual_gate_mean_list, dim=0).mean() if residual_gate_mean_list else torch.zeros(1, device=self.device)
+        residual_gate_max = torch.stack(residual_gate_max_list, dim=0).mean() if residual_gate_max_list else torch.zeros(1, device=self.device)
+        residual_comm_ratio = torch.stack(residual_comm_ratio_list, dim=0).mean() if residual_comm_ratio_list else torch.zeros(1, device=self.device)
         debug = {
             "kl_raw": float(kl_raw.item()),
             "trust_score_mean": float(trust_score_mean.item()),
@@ -421,8 +442,13 @@ class R_VITAPolicy:
             "trust_score_p50": float(trust_score_p50.item()),
             "trust_score_p90": float(trust_score_p90.item()),
             "trust_gate_ratio": float(trust_gate_ratio.item()),
+            "comm_valid_neighbors": float(comm_valid_neighbors.item()),
+            "comm_kept_neighbors": float(comm_kept_neighbors.item()),
             "comm_strength": float(comm_strength.item()) if comm_strength is not None else 0.0,
             "comm_enabled": float(comm_enabled.item()) if comm_enabled is not None else 0.0,
+            "residual_gate_mean": float(residual_gate_mean.item()),
+            "residual_gate_max": float(residual_gate_max.item()),
+            "residual_comm_ratio": float(residual_comm_ratio.item()),
         }
 
         if self._use_policy_active_masks and active_masks is not None:

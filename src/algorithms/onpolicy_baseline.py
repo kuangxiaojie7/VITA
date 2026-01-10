@@ -109,6 +109,9 @@ def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[
 
     args += ["--data_chunk_length", str(_as_int(train_cfg.get("data_chunk_length", 10), name="train.data_chunk_length"))]
 
+    # Learning-rate schedule (store_true default=False in upstream parser).
+    _flag_store_true(args, "use_linear_lr_decay", bool(train_cfg.get("use_linear_lr_decay", False) or onpolicy_cfg.get("use_linear_lr_decay", False)))
+
     if algorithm_name == "rvita":
         history_length = _as_int(model_cfg.get("history_length", 1), name="model.history_length")
         args += ["--stacked_frames", str(history_length)]
@@ -124,6 +127,7 @@ def build_onpolicy_smac_args(cfg: Dict[str, Any], *, config_path: Path) -> List[
         args += ["--vita_comm_dropout", str(_as_float(model_cfg.get("comm_dropout", 0.1), name="model.comm_dropout"))]
         args += ["--vita_comm_sight_range", str(_as_float(model_cfg.get("comm_sight_range", 0.0), name="model.comm_sight_range"))]
         args += ["--vita_max_neighbors", str(_as_int(model_cfg.get("max_neighbors", 4), name="model.max_neighbors"))]
+        _flag_store_true(args, "vita_vib_deterministic", bool(model_cfg.get("vib_deterministic", False)))
         if not bool(model_cfg.get("enable_trust", True)):
             _flag_store_true(args, "vita_disable_trust", True)
         if not bool(model_cfg.get("enable_kl", True)):

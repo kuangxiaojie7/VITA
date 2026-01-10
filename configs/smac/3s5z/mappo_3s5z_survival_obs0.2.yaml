@@ -7,16 +7,17 @@ env:
   difficulty: "7"
   num_envs: 8
   reward_scale: 1.0
-  obs_noise_std: 0.05
-  packet_drop_prob: 0.05
+  # Base harsh environment: break single-agent perception.
+  obs_noise_std: 0.2
+  packet_drop_prob: 0.0
   malicious_agent_prob: 0.0
   malicious_obs_noise_scale: 3.0
-  noise_warmup_steps: 50000
+  noise_warmup_steps: 0
 model:
   hidden_dim: 64
 train:
   episode_length: 400
-  updates: 3125
+  updates: 4688
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
@@ -28,3 +29,4 @@ train:
   max_grad_norm: 10.0
   eval_interval_updates: 25
   eval_episodes: 32
+

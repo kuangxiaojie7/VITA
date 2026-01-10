@@ -224,6 +224,9 @@ class R_VITA:
             "comm_kept_neighbors": 0.0,
             "comm_strength": 0.0,
             "comm_enabled": 0.0,
+            "residual_gate_mean": 0.0,
+            "residual_gate_max": 0.0,
+            "residual_comm_ratio": 0.0,
         }
 
         for _ in range(self.ppo_epoch):
@@ -265,6 +268,9 @@ class R_VITA:
                 train_info["comm_kept_neighbors"] += float(debug.get("comm_kept_neighbors", 0.0))
                 train_info["comm_strength"] += float(debug.get("comm_strength", 0.0))
                 train_info["comm_enabled"] += float(debug.get("comm_enabled", 0.0))
+                train_info["residual_gate_mean"] += float(debug.get("residual_gate_mean", 0.0))
+                train_info["residual_gate_max"] += float(debug.get("residual_gate_max", 0.0))
+                train_info["residual_comm_ratio"] += float(debug.get("residual_comm_ratio", 0.0))
 
         num_updates = self.ppo_epoch * self.num_mini_batch
         for k in train_info.keys():

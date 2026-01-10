@@ -7,11 +7,19 @@ env:
   difficulty: "7"
   num_envs: 8
   reward_scale: 1.0
-  obs_noise_std: 0.05
-  packet_drop_prob: 0.05
+  # Base harsh environment: break single-agent perception.
+  obs_noise_std: 0.2
+  packet_drop_prob: 0.0
   malicious_agent_prob: 0.0
   malicious_obs_noise_scale: 3.0
-  noise_warmup_steps: 50000
+  noise_warmup_steps: 0
+
+  # Byzantine communication: poison only the neighbor messages.
+  comm_noise_std: 0.0
+  comm_packet_drop_prob: 0.0
+  comm_malicious_agent_prob: 0.3
+  comm_malicious_noise_scale: 3.0
+  comm_malicious_mode: bernoulli
 
 model:
   hidden_dim: 128
@@ -29,9 +37,10 @@ model:
   comm_sight_range: 999
   max_neighbors: 7
   history_length: 1
+
 train:
   episode_length: 400
-  updates: 3125
+  updates: 4688
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
@@ -42,12 +51,13 @@ train:
   value_loss_coef: 0.5
   use_value_active_masks: false
   max_grad_norm: 10.0
+  comm_delay_updates: 0
+  comm_warmup_updates: 0
+  comm_full_warmup_updates: 0
+  trust_delay_updates: 0
   trust_warmup_updates: 500
-  kl_warmup_updates: 500
-  trust_delay_updates: 280
   kl_delay_updates: 0
-  comm_delay_updates: 80
-  comm_warmup_updates: 80
-  comm_full_warmup_updates: 120
+  kl_warmup_updates: 500
   eval_interval_updates: 25
   eval_episodes: 32
+
