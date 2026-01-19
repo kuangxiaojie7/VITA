@@ -7,16 +7,17 @@ env:
   difficulty: "7"
   num_envs: 8
   reward_scale: 1.0
-  obs_noise_std: 0.05
+  obs_noise_std: 0.0
   packet_drop_prob: 0.05
-  malicious_agent_prob: 0.0
-  malicious_obs_noise_scale: 3.0
+  malicious_agent_prob: 0.1
+  malicious_obs_noise_scale: 0.1
+  malicious_obs_mode: add
   noise_warmup_steps: 50000
 model:
   hidden_dim: 64
 train:
   episode_length: 400
-  updates: 3125
+  updates: 4688
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95

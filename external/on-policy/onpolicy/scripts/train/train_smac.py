@@ -30,6 +30,11 @@ def _env_float(name: str, default: float = 0.0) -> float:
         return float(default)
 
 
+def _env_str(name: str, default: str = "") -> str:
+    value = os.environ.get(name)
+    return default if value is None else str(value)
+
+
 def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -91,6 +96,7 @@ class NoisyEnvWrapper:
       - ONPOLICY_PACKET_DROP_PROB
       - ONPOLICY_MALICIOUS_AGENT_PROB
       - ONPOLICY_MALICIOUS_OBS_NOISE_SCALE
+      - ONPOLICY_MALICIOUS_OBS_MODE  ("replace" | "add")
       - ONPOLICY_NOISE_WARMUP_STEPS
       - ONPOLICY_REWARD_MULT
 
@@ -105,6 +111,7 @@ class NoisyEnvWrapper:
         packet_drop_prob: float = 0.0,
         malicious_agent_prob: float = 0.0,
         malicious_obs_noise_scale: float = 3.0,
+        malicious_obs_mode: str = "replace",
         noise_warmup_steps: int = 0,
         start_at_full_noise: bool = False,
         reward_mult: float = 1.0,
@@ -114,6 +121,7 @@ class NoisyEnvWrapper:
         self.packet_drop_prob = float(packet_drop_prob)
         self.malicious_agent_prob = float(malicious_agent_prob)
         self.malicious_obs_noise_scale = float(malicious_obs_noise_scale)
+        self.malicious_obs_mode = str(malicious_obs_mode or "replace").strip().lower()
         self.noise_warmup_steps = int(max(0, noise_warmup_steps))
         self.reward_mult = float(reward_mult)
 
@@ -191,7 +199,13 @@ class NoisyEnvWrapper:
             base_std = obs_noise_std if obs_noise_std > 0.0 else 1.0
             std = float(max(1e-6, base_std) * malicious_obs_noise_scale)
             mal = self._malicious_mask.astype(bool)
-            obs_arr[mal] = self._rng.normal(0.0, std, size=obs_arr[mal].shape).astype(np.float32)
+            noise = self._rng.normal(0.0, std, size=obs_arr[mal].shape).astype(np.float32)
+            mode = str(getattr(self, "malicious_obs_mode", "replace") or "replace").strip().lower()
+            if mode in {"add", "additive"}:
+                obs_arr[mal] = obs_arr[mal] + noise
+            else:
+                # Default: fully overwrite malicious agents' obs (hard DoS-like corruption).
+                obs_arr[mal] = noise
         return obs_arr
 
     def __getattr__(self, item):
@@ -203,6 +217,7 @@ def maybe_wrap_noise(env, *, start_at_full_noise: bool = False):
     packet_drop_prob = _env_float("ONPOLICY_PACKET_DROP_PROB", 0.0)
     malicious_agent_prob = _env_float("ONPOLICY_MALICIOUS_AGENT_PROB", 0.0)
     malicious_obs_noise_scale = _env_float("ONPOLICY_MALICIOUS_OBS_NOISE_SCALE", 3.0)
+    malicious_obs_mode = _env_str("ONPOLICY_MALICIOUS_OBS_MODE", "replace").strip().lower()
     noise_warmup_steps = int(_env_float("ONPOLICY_NOISE_WARMUP_STEPS", 0.0))
     reward_mult = _env_float("ONPOLICY_REWARD_MULT", 1.0)
     if (
@@ -219,6 +234,7 @@ def maybe_wrap_noise(env, *, start_at_full_noise: bool = False):
         packet_drop_prob=packet_drop_prob,
         malicious_agent_prob=malicious_agent_prob,
         malicious_obs_noise_scale=malicious_obs_noise_scale,
+        malicious_obs_mode=malicious_obs_mode,
         noise_warmup_steps=noise_warmup_steps,
         start_at_full_noise=start_at_full_noise,
         reward_mult=reward_mult,
