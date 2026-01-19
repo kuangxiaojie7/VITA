@@ -159,7 +159,8 @@ class VITAAgent(torch.nn.Module):
                 fallback = torch.zeros_like(trust_gate_hard)
                 fallback[torch.arange(best.size(0), device=best.device), best, 0] = 1.0
                 trust_gate_hard = torch.where(need_fallback, fallback, trust_gate_hard)
-                trust_gate = trust_gate_hard + trust_scores - trust_scores.detach()
+                trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
+                trust_gate = (1.0 - strength) * trust_gate_soft + strength * trust_gate_hard
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
@@ -274,7 +275,8 @@ class VITAAgent(torch.nn.Module):
                 fallback = torch.zeros_like(trust_gate_hard)
                 fallback[torch.arange(best.size(0), device=best.device), best, 0] = 1.0
                 trust_gate_hard = torch.where(need_fallback, fallback, trust_gate_hard)
-                trust_gate = trust_gate_hard + trust_scores - trust_scores.detach()
+                trust_gate_soft = trust_scores.clamp(min=0.0, max=1.0)
+                trust_gate = (1.0 - strength) * trust_gate_soft + strength * trust_gate_hard
                 comm_mask = comm_mask * trust_gate
             neighbor_feat = neighbor_feat * comm_mask
             trust_scores = trust_scores * comm_mask + (1e-6 * (1.0 - comm_mask))
